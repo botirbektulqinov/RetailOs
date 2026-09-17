@@ -1,0 +1,67 @@
+name: retailos
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: retailos-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-retailos}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-retailos}
+      POSTGRES_DB: ${POSTGRES_DB:-retailos}
+    ports:
+      - '${POSTGRES_PORT:-55432}:5432'
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      # `pg_isready` alone returns healthy before the DB finishes its first-run
+      # init, so the api container would race it. `-d` waits for the real database.
+      test: ['CMD-SHELL', 'pg_isready -U ${POSTGRES_USER:-retailos} -d ${POSTGRES_DB:-retailos}']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Migrations run as their own step and never from the application bootstrap
+  # (docs/ARCHITECTURE.md §32.4). Two api replicas racing to migrate is a bad
+  # first production incident, and `migrate deploy` is not destructive.
+  migrate:
+    build:
+      context: .
+      target: builder
+    container_name: retailos-migrate
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-retailos}:${POSTGRES_PASSWORD:-retailos}@postgres:5432/${POSTGRES_DB:-retailos}?schema=public
+    command: ['npx', 'prisma', 'migrate', 'deploy']
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    build:
+      context: .
+      target: runtime
+    container_name: retailos-api
+    restart: unless-stopped
+    environment:
+      # Pinned, not interpolated from .env. This service runs the production
+      # image, whose devDependencies are pruned away; telling it NODE_ENV=development
+      # would make it ask for dev-only packages (pino-pretty) that are not there.
+      # For hot-reload development, run `npm run start:dev` on the host instead.
+      NODE_ENV: production
+      PORT: 3000
+      DATABASE_URL: postgresql://${POSTGRES_USER:-retailos}:${POSTGRES_PASSWORD:-retailos}@postgres:5432/${POSTGRES_DB:-retailos}?schema=public
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET is required}
+      JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET:?JWT_REFRESH_SECRET is required}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      SWAGGER_ENABLED: ${SWAGGER_ENABLED:-true}
+    ports:
+      - '${PORT:-3000}:3000'
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+volumes:
+  postgres-data:
