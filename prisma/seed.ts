@@ -60,6 +60,64 @@ const DEMO = {
   ],
 } as const;
 
+/**
+ * A small demo catalogue, using the names the design's screens show.
+ * Two-level categories and one variant product, so the variants screen has
+ * something real to render.
+ */
+const DEMO_CATALOG = {
+  categories: [
+    { key: 'drinks', name: 'Ichimliklar', parent: null },
+    { key: 'hot', name: 'Issiq', parent: 'drinks' },
+    { key: 'tea', name: 'Choy va qahva', parent: 'hot' },
+    { key: 'food', name: 'Oziq-ovqat', parent: null },
+    { key: 'dairy', name: 'Sut mahsulotlari', parent: 'food' },
+    { key: 'fashion', name: 'Moda', parent: null },
+    { key: 'adults', name: 'Kattalar', parent: 'fashion' },
+    { key: 'clothes', name: 'Kiyim', parent: 'adults' },
+  ],
+  products: [
+    {
+      name: 'Safia qora choy 100g',
+      category: 'tea',
+      sku: 'CH-021',
+      barcode: '4780012345678',
+      sellingPrice: 24_000n,
+      purchasePrice: 17_500n,
+      minStock: '5.000',
+    },
+    {
+      name: 'Artel choynak 1.7L',
+      category: 'hot',
+      sku: 'AR-170',
+      barcode: '4780012345685',
+      sellingPrice: 289_000n,
+      purchasePrice: 230_000n,
+      minStock: '2.000',
+    },
+    {
+      name: 'Nestle sut 1L',
+      category: 'dairy',
+      sku: 'SU-001',
+      barcode: '4780012345692',
+      sellingPrice: 18_000n,
+      purchasePrice: 14_000n,
+      minStock: '10.000',
+    },
+  ],
+  /** The design's "Futbolka Classic - 8 variant". */
+  variantProduct: {
+    name: 'Futbolka Classic',
+    category: 'clothes',
+    baseSku: 'FT',
+    colors: [
+      { code: 'Q', name: 'Qora' },
+      { code: 'O', name: 'Oq' },
+    ],
+    sizes: ['S', 'M', 'L', 'XL'],
+  },
+} as const;
+
 type Db = Pick<
   PrismaClient,
   'role' | 'organization' | 'store' | 'warehouse' | 'user' | 'storeMembership'
@@ -232,6 +290,126 @@ async function seedDemo(client: PrismaClient): Promise<string> {
   });
 }
 
+async function seedCatalog(client: PrismaClient): Promise<string> {
+  const organization = await client.organization.findUnique({
+    where: { slug: DEMO.organization.slug },
+    select: { id: true },
+  });
+  if (!organization) return 'skipped (no demo organization)';
+
+  const organizationId = organization.id;
+
+  return client.$transaction(async (tx) => {
+    // Categories, parents first, so a child always finds its parent's path.
+    const idByKey = new Map<string, { id: string; name: string; path: string; depth: number }>();
+
+    for (const category of DEMO_CATALOG.categories) {
+      const parent = category.parent ? idByKey.get(category.parent) : undefined;
+      const path = parent ? (parent.path ? `${parent.path} / ${parent.name}` : parent.name) : '';
+      const depth = parent ? parent.depth + 1 : 1;
+
+      const existing = await tx.category.findFirst({
+        where: { organizationId, name: category.name, parentId: parent?.id ?? null },
+        select: { id: true, name: true, path: true, depth: true },
+      });
+
+      const row =
+        existing ??
+        (await tx.category.create({
+          data: {
+            organizationId,
+            parentId: parent?.id ?? null,
+            name: category.name,
+            path,
+            depth,
+          },
+          select: { id: true, name: true, path: true, depth: true },
+        }));
+
+      idByKey.set(category.key, row);
+    }
+
+    let productsCreated = 0;
+    let variantsCreated = 0;
+
+    for (const product of DEMO_CATALOG.products) {
+      const existing = await tx.productVariant.findFirst({
+        where: { organizationId, sku: product.sku },
+        select: { id: true },
+      });
+      if (existing) continue;
+
+      const created = await tx.product.create({
+        data: {
+          organizationId,
+          categoryId: idByKey.get(product.category)?.id ?? null,
+          name: product.name,
+        },
+        select: { id: true },
+      });
+
+      await tx.productVariant.create({
+        data: {
+          organizationId,
+          productId: created.id,
+          sku: product.sku,
+          barcode: product.barcode,
+          sellingPrice: product.sellingPrice,
+          purchasePrice: product.purchasePrice,
+          minStock: product.minStock,
+          isDefault: true,
+        },
+      });
+      productsCreated += 1;
+    }
+
+    // The variant product: two colours x four sizes, priced like the screen.
+    const spec = DEMO_CATALOG.variantProduct;
+    const firstSku = `${spec.baseSku}-${spec.colors[0].code}-${spec.sizes[0]}`;
+    const alreadySeeded = await tx.productVariant.findFirst({
+      where: { organizationId, sku: firstSku },
+      select: { id: true },
+    });
+
+    if (!alreadySeeded) {
+      const shirt = await tx.product.create({
+        data: {
+          organizationId,
+          categoryId: idByKey.get(spec.category)?.id ?? null,
+          name: spec.name,
+          hasVariants: true,
+        },
+        select: { id: true },
+      });
+
+      let first = true;
+      for (const color of spec.colors) {
+        for (const size of spec.sizes) {
+          await tx.productVariant.create({
+            data: {
+              organizationId,
+              productId: shirt.id,
+              sku: `${spec.baseSku}-${color.code}-${size}`,
+              name: `${color.name} / ${size}`,
+              attributes: { Rang: color.name, "O'lcham": size },
+              // White costs more, exactly as the variants screen shows.
+              sellingPrice: color.code === 'O' ? 135_000n : 129_000n,
+              purchasePrice: 90_000n,
+              minStock: '2.000',
+              isDefault: first,
+            },
+          });
+          first = false;
+          variantsCreated += 1;
+        }
+      }
+      productsCreated += 1;
+    }
+
+    return `${DEMO_CATALOG.categories.length} categories, ${productsCreated} new product(s), ${variantsCreated} new variant(s)`;
+  });
+}
+
 interface SeedStep {
   name: string;
   /** true when the step may run against a production database. */
@@ -242,6 +420,7 @@ interface SeedStep {
 const steps: SeedStep[] = [
   { name: 'verify-schema', productionSafe: true, run: verifySchema },
   { name: 'demo-data', productionSafe: false, run: seedDemo },
+  { name: 'demo-catalog', productionSafe: false, run: seedCatalog },
 ];
 
 async function main(): Promise<void> {

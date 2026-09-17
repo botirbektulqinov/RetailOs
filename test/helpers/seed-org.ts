@@ -180,6 +180,15 @@ export async function dropTestOrg(db: PrismaClient, organizationId: string): Pro
     await db.$executeRaw`ALTER TABLE audit_log ENABLE TRIGGER tg_audit_log_immutable`;
   }
 
+  // Catalog before identity: variants reference products, products reference
+  // categories, and every one of those foreign keys is ON DELETE RESTRICT.
+  await db.productVariant.deleteMany({ where: { organizationId } });
+  await db.product.deleteMany({ where: { organizationId } });
+  // Children first, or a parent delete trips fk_category_parent_same_org.
+  for (let depth = 3; depth >= 1; depth -= 1) {
+    await db.category.deleteMany({ where: { organizationId, depth } });
+  }
+
   await db.storeMembership.deleteMany({ where: { organizationId } });
   await db.user.deleteMany({ where: { organizationId } });
   await db.role.deleteMany({ where: { organizationId } });
