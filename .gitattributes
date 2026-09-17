@@ -1,0 +1,7 @@
+# Prettier enforces `endOfLine: lf`. Without this, Git's autocrlf would hand
+# Windows checkouts CRLF files that `npm run format:check` then rejects.
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.ico binary
