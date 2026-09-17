@@ -3,7 +3,11 @@ import { PrismaPg } from '@prisma/adapter-pg';
 import { PrismaClient } from '@prisma/client';
 import { Pool } from 'pg';
 
+import { createTenantExtension } from '../common/tenant/tenant-extension';
 import { AppConfig } from '../config/config.module';
+
+/** The tenant-scoped client type, inferred from the extension. */
+export type ScopedPrismaClient = ReturnType<PrismaClient['$extends']> extends infer T ? T : never;
 
 /**
  * The single PrismaClient for the process.
@@ -13,7 +17,7 @@ import { AppConfig } from '../config/config.module';
  *
  * The Pool is constructed explicitly rather than letting PrismaPg create one,
  * so shutdown can close it deterministically. Leaving it to the adapter left
- * sockets open and hung both `app.close()` in tests and SIGTERM in Docker.
+ * sockets open and hung both app.close() in tests and SIGTERM in Docker.
  *
  * Deliberately NOT here: any migration behaviour. The application never runs
  * `migrate` at boot (docs/ARCHITECTURE.md §32.4) — two replicas racing to
@@ -23,6 +27,15 @@ import { AppConfig } from '../config/config.module';
 export class PrismaService extends PrismaClient implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(PrismaService.name);
   private readonly pool: Pool;
+
+  /**
+   * The client every feature module must use.
+   *
+   * It applies the tenant isolation extension (§4.3): organization scoping is
+   * injected into reads and creates, and a single-row operation targeted by
+   * bare id is refused outright.
+   */
+  readonly db: ReturnType<typeof this.buildScopedClient>;
 
   constructor(config: AppConfig) {
     const pool = new Pool({
@@ -41,6 +54,25 @@ export class PrismaService extends PrismaClient implements OnModuleInit, OnModul
     this.pool.on('error', (error: Error) => {
       this.logger.error(`Idle database client error: ${error.message}`);
     });
+
+    this.db = this.buildScopedClient();
+  }
+
+  private buildScopedClient() {
+    return this.$extends(createTenantExtension());
+  }
+
+  /**
+   * The raw, UNSCOPED client. Every call site is a deliberate cross-tenant
+   * operation and must say why in a comment.
+   *
+   * Legitimate uses: resolving a login by phone (the tenant is not known until
+   * the user is found), seeding, and platform-level maintenance. Using it to
+   * "make a query work" is how tenant isolation is lost, so it is named to be
+   * obvious in review and greppable in CI.
+   */
+  asSystem(): PrismaClient {
+    return this;
   }
 
   async onModuleInit(): Promise<void> {
