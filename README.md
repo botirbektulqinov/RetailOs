@@ -3,9 +3,9 @@
 Retail management platform for small stores, designed to grow into a
 multi-tenant SaaS without a rewrite. NestJS modular monolith on PostgreSQL.
 
-**Current state: Sprint 2 — identity, tenancy and RBAC.** Authentication,
-organizations, stores, employees, roles and permissions are implemented. No
-selling, catalog or inventory endpoints yet; see [Roadmap](#roadmap).
+**Current state: Sprint 3 — product catalog.** Authentication, tenancy and
+RBAC (Sprint 2) plus categories, products and variants. No inventory, POS or
+selling endpoints yet; see [Roadmap](#roadmap).
 
 The approved design is [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and it is
 the source of truth for every decision below. Section references like
@@ -419,6 +419,177 @@ exists is itself a leak.
 
 ---
 
+## Product catalog
+
+### Ownership: organization, not store
+
+A product is the same product in every branch, so the catalog hangs off the
+**organization**. Per-store price and availability are the real variations and
+both are additive later (a `store_product_override` table) without moving the
+product itself. Store-scoping products now would duplicate SKUs across branches
+and break barcode lookup, which must resolve to exactly one row.
+
+### The three models
+
+```
+Category  (hierarchical, max 3 levels)
+    |
+    +-- Product          shared identity: name, brand, images, category
+            |
+            +-- ProductVariant    what is actually SOLD
+                                  SKU, barcode, prices, min stock, unit
+```
+
+**Every product has at least one variant, always.** Creating a product
+auto-creates one flagged `isDefault`, which the UI never shows and edits
+inline. That is what lets inventory, sale lines and purchase lines point at a
+single foreign key forever instead of branching on "does this have variants?".
+
+- **Simple product** — one variant, `isDefault = true`, `hasVariants = false`.
+- **Variant product** — several variants, `hasVariants = true`. The flag is
+  presentation only; nothing downstream branches on it.
+
+Variant combinations live in a JSONB `attributes` map
+(`{ "Rang": "Qora", "O'lcham": "S" }`). The option pickers the variants screen
+shows are **derived** from the variants themselves — there is no
+attribute/value/assignment triple, because three tables would store exactly
+what one pass over already-loaded rows computes.
+
+### Categories
+
+Three levels, root first: the categories screen renders a two-ancestor path
+(`Choy va qahva` under `Ichimliklar / Issiq`). The path is **materialised** on
+write, so listing 18 categories is one query rather than a recursive lookup per
+row — and renaming or moving a node rewrites its descendants' paths.
+
+Rejected at write time: a cycle (`A -> B -> A`, at any depth), a fourth level,
+and two siblings sharing a name case-insensitively.
+
+### SKU and barcode
+
+| | Rule |
+|---|---|
+| **Uniqueness** | **per organization**, not global. Two shops may legitimately both use `CH-021`. |
+| **Scope** | only among **live** rows — the unique indexes are partial on `archived_at IS NULL`, so archiving a product frees its SKU and barcode for reuse. |
+| **SKU normalisation** | trimmed, **uppercased**, inner spaces removed. `ch-021` and `CH-021` cannot both exist and later confuse a stock count. |
+| **Barcode normalisation** | non-digits stripped; empty becomes `null`. A scanner emits digits, so anything else a human typed would never match a scan. |
+| **Barcode format** | 6–20 digits, enforced by a database `CHECK`. |
+
+Duplicates are caught by the **database**, not by a pre-check. `if (!exists)
+create` still races: two requests can both pass the check. The unique index is
+the real guard and the API maps its violation to `SKU_ALREADY_USED` or
+`BARCODE_ALREADY_USED` — the latter renders as "Bu shtrix-kod boshqa mahsulotda
+mavjud", exactly as the design's product form shows it.
+
+### Pricing
+
+Both prices live on the **variant**, because the design's variants screen
+prices each combination separately (Qora 129 000, Oq 135 000).
+
+- `purchasePrice` — "Xarid narxi"
+- `sellingPrice` — the price the POS charges
+
+Both are `BIGINT` minor units (§8): `24000` means 24 000 so'm. Both must be
+`>= 0`, enforced by a `CHECK`.
+
+**There is deliberately no rule that selling price must exceed purchase
+price.** Clearing stock below cost is ordinary retail, and a backend that
+forbade it would be wrong about the business.
+
+For a simple product the price can be set through `PATCH /products/:id` —
+the client never has to know the default variant exists.
+
+### Archiving, never deleting
+
+Sales, purchases and inventory movements reference a product forever: a receipt
+from last year must still name what was sold. So:
+
+- `PATCH /products/:id/archive` sets `archivedAt` and archives its variants.
+- Archived products vanish from search, listing and POS barcode lookup, but
+  remain readable by id and keep every historical relation.
+- `PATCH /products/:id/restore` brings one back — and returns `409` if another
+  product has taken its SKU in the meantime.
+- Categories refuse to archive while they still hold products or
+  subcategories; the foreign keys are `ON DELETE RESTRICT`.
+
+### Search, filtering, sorting, pagination
+
+Search (`?q=`) matches product name, brand, variant SKU and variant barcode.
+**Every branch is a database predicate** — the catalogue is never loaded into
+JavaScript and filtered there. Trigram indexes back the substring matching.
+
+| Filter | |
+|---|---|
+| `categoryId`, `status`, `brand`, `hasVariants` | direct column predicates |
+| `minPrice` / `maxPrice` | matched against live variants |
+| `includeArchived` | off by default |
+
+Sorting is a **whitelist** (`createdAt`, `updatedAt`, `name`, each `:asc` or
+`:desc`); anything else is a `400`. Raw client input never becomes an
+`ORDER BY`.
+
+Pagination is offset-based with `limit` capped at 100, as everywhere else.
+
+### POS barcode lookup
+
+```bash
+GET /api/v1/products/lookup?barcode=4780012345678
+```
+
+One indexed read on `(organization_id, barcode)`. Sprint 5 calls this on every
+scan, so it deliberately does no joins beyond the product row it returns.
+Archived and inactive products are not found.
+
+### Trying it
+
+```bash
+TOKEN=<accessToken from /auth/login>
+
+# Category tree with product counts
+curl -s "$API/categories" -H "Authorization: Bearer $TOKEN"
+
+# Create a product (creates its default variant too)
+curl -s -X POST "$API/products" -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' -d '{
+    "name": "Safia qora choy 100g",
+    "sku": "CH-021",
+    "barcode": "4780012345678",
+    "sellingPrice": 24000,
+    "purchasePrice": 17500,
+    "minStock": "5.000"
+  }'
+
+# Add a variant
+curl -s -X POST "$API/products/<id>/variants" -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' -d '{
+    "sku": "FT-Q-S",
+    "attributes": { "Rang": "Qora", "O‘lcham": "S" },
+    "sellingPrice": 129000
+  }'
+
+# Search, filter, sort
+curl -s "$API/products?q=choy&sort=name:asc&limit=20" -H "Authorization: Bearer $TOKEN"
+```
+
+`npm run seed` creates a demo catalogue matching the design's screens: an
+eight-category tree three levels deep, three simple products, and
+`Futbolka Classic` with eight variants (two colours x four sizes).
+
+### Permissions
+
+| Action | Permission |
+|---|---|
+| read products and categories | `products.read` |
+| create | `products.create` |
+| update, and all variant writes | `products.update` |
+| archive | `products.delete` |
+
+Categories reuse the product permissions rather than declaring their own: a
+category exists only to organise products, and a separate `categories.*` group
+would be four more strings that always move together with `products.*`.
+
+---
+
 ## Foundation behaviour worth knowing
 
 **API versioning.** URI-based: every route lives under `/api/v1/...`. The
@@ -474,8 +645,8 @@ Sprint 1 is the foundation. Phases follow *§33 Implementation order*:
 |---|---|---|
 | **1 ✅** | Foundation: config, Prisma, errors, logging, health, Docker, tests | `docker compose up` serves `/health`; money tests green |
 | **2 ✅** | Tenancy & auth: Organization, Store, Warehouse, User, Role, StoreMembership, JWT + refresh rotation, guard chain, Prisma tenant extension, audit service | the tenant-isolation suite passes |
-| **3** | Catalog: Category, Product, ProductVariant, barcode lookup, search |
-| 4 | Inventory core: levels, movements, the single `apply()` write path |
+| **3 ✅** | Catalog: Category, Product, ProductVariant, barcode lookup, search |
+| **4** | Inventory core: levels, movements, the single `apply()` write path |
 | 5 | Cash register: registers, shifts, movements |
 | 6 | Sales / POS: pricing pipeline, checkout transaction, payments, idempotency |
 | 7+ | Customers & debt, returns & exchanges, procurement, counts & transfers, loyalty, reporting |
