@@ -1,0 +1,22 @@
+// RetailOS — Prisma schema.
+//
+// Sprint 1 scope: foundation only. No domain models are declared yet; the full
+// draft lives in prisma/schema.draft.prisma and is promoted model-by-model as
+// each sprint lands (see docs/ARCHITECTURE.md §33 "Implementation order").
+//
+// Naming convention (docs/ARCHITECTURE.md §5.1):
+//   - Prisma models  PascalCase, fields camelCase
+//   - tables/columns snake_case via @@map / @map
+//   - enums          SCREAMING_SNAKE values
+// The connection URL lives in prisma.config.ts (Prisma 7 no longer allows
+// `url` in the schema); the runtime connects through the pg driver adapter.
+
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["postgresqlExtensions"]
+}
+
+datasource db {
+  provider   = "postgresql"
+  extensions = [pgcrypto, citext, pg_trgm]
+}
