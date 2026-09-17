@@ -367,3 +367,149 @@ model AuditLog {
   @@index([organizationId, action, createdAt(sort: Desc)])
   @@map("audit_log")
 }
+
+// ──────────────────────────────────────────────────────────────────────────
+// Catalog (Sprint 3)
+// ──────────────────────────────────────────────────────────────────────────
+
+enum ProductStatus {
+  ACTIVE
+  INACTIVE
+}
+
+/// Sellable unit of measure. Decides whether a fractional quantity is legal:
+/// you can sell 1.5 kg of rice, not 1.5 phone chargers.
+enum Unit {
+  PIECE
+  KG
+  LITRE
+  METRE
+  PACK
+}
+
+/// Hierarchical, because the categories screen renders a path
+/// ("Choy va qahva" under "Ichimliklar / Issiq") and a product count per row.
+model Category {
+  id             String  @id @default(uuid()) @db.Uuid
+  organizationId String  @map("organization_id") @db.Uuid
+  parentId       String? @map("parent_id") @db.Uuid
+
+  name        String
+  description String?
+
+  /// Materialised ancestor path, maintained on write. The screen shows it on
+  /// every row, and recomputing it per row would be a recursive query per
+  /// category — the classic N+1 that turns an 18-row list into 40 queries.
+  path String @default("")
+
+  /// Root is 1. Capped at MAX_CATEGORY_DEPTH in the service.
+  depth Int @default(1) @db.SmallInt
+
+  sortOrder  Int          @default(0) @map("sort_order")
+  status     EntityStatus @default(ACTIVE)
+  archivedAt DateTime?    @map("archived_at") @db.Timestamptz(6)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  parent   Category?  @relation("CategoryTree", fields: [parentId], references: [id], onDelete: Restrict)
+  children Category[] @relation("CategoryTree")
+  products Product[]
+
+  @@unique([organizationId, id])
+  @@index([organizationId, parentId])
+  @@index([organizationId, status])
+  @@map("category")
+}
+
+/// Shared identity. What is actually sold is a ProductVariant — see §10.2:
+/// every product has at least one, so inventory, sale lines and purchase lines
+/// can all point at a single foreign key forever.
+model Product {
+  id             String  @id @default(uuid()) @db.Uuid
+  organizationId String  @map("organization_id") @db.Uuid
+  categoryId     String? @map("category_id") @db.Uuid
+
+  name        String
+  description String?
+  brand       String?
+
+  /// URLs only. Binaries live in object storage; PostgreSQL stores the pointer.
+  imageUrls String[] @default([]) @map("image_urls")
+
+  /// Presentation only: false hides the variant editor and edits the single
+  /// default variant inline. Authorization and inventory never branch on it.
+  hasVariants Boolean @default(false) @map("has_variants")
+
+  status     ProductStatus @default(ACTIVE)
+  archivedAt DateTime?     @map("archived_at") @db.Timestamptz(6)
+
+  /// Optimistic concurrency for the edit form — two managers in two tabs must
+  /// not silently overwrite each other.
+  version Int @default(0)
+
+  createdBy String?  @map("created_by") @db.Uuid
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  category Category?        @relation(fields: [categoryId], references: [id], onDelete: Restrict)
+  variants ProductVariant[]
+
+  @@unique([organizationId, id])
+  @@index([organizationId, categoryId])
+  @@index([organizationId, status, archivedAt])
+  @@index([organizationId, createdAt(sort: Desc)])
+  @@map("product")
+}
+
+model ProductVariant {
+  id             String @id @default(uuid()) @db.Uuid
+  organizationId String @map("organization_id") @db.Uuid
+  productId      String @map("product_id") @db.Uuid
+
+  /// Uppercased and trimmed on write; unique per organization among live rows.
+  sku String
+
+  /// Digits only, optional. The POS scan path is a single index hit on
+  /// (organization_id, barcode).
+  barcode String?
+
+  /// null for the default variant of a simple product. For a variant product
+  /// it is the rendered option combination, e.g. "Qora / S".
+  name String?
+
+  /// { "Rang": "Qora", "O'lcham": "S" }. A JSONB map rather than an
+  /// attribute/value/assignment triple: the variants screen only ever renders
+  /// the combination, and three tables would buy nothing the screen uses.
+  attributes Json @default("{}")
+
+  unit Unit @default(PIECE)
+
+  /// Money is BIGINT minor units of the organization currency (§8). UZS has
+  /// exponent 0, so 24000 means 24 000 so'm.
+  purchasePrice BigInt @default(0) @map("purchase_price")
+  sellingPrice  BigInt @map("selling_price")
+
+  /// "Minimal qoldiq · 5 dona" on the product screen. Drives the low-stock
+  /// badge that Sprint 4 computes; nothing here reads stock.
+  minStock Decimal @default(0) @map("min_stock") @db.Decimal(14, 3)
+
+  /// Exactly one per product, auto-created. Lets a simple product be edited as
+  /// if it had no variants while the schema always has one to point at.
+  isDefault Boolean @default(false) @map("is_default")
+
+  status     ProductStatus @default(ACTIVE)
+  archivedAt DateTime?     @map("archived_at") @db.Timestamptz(6)
+  version    Int           @default(0)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  product Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@unique([organizationId, id])
+  @@index([organizationId, barcode])
+  @@index([organizationId, sku])
+  @@index([productId])
+  @@map("product_variant")
+}
