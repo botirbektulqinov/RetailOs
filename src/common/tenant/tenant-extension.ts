@@ -28,6 +28,9 @@ const TENANT_MODELS = new Set<string>([
   'Role',
   'RefreshToken',
   'AuditLog',
+  'Category',
+  'Product',
+  'ProductVariant',
 ]);
 
 /** Operations whose `where` must be narrowed to the tenant. */
