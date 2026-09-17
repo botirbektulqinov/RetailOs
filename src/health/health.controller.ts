@@ -9,11 +9,15 @@ import type { Response } from 'express';
 
 import { SkipThrottle } from '@nestjs/throttler';
 
+import { Public } from '../auth/decorators/public.decorator';
+
 import { HealthResponseDto, ReadinessResponseDto } from './health.dto';
 import { HealthService } from './health.service';
 
 @ApiTags('health')
 @Controller('health')
+// Probes run before anyone has a token, and a load balancer cannot hold one.
+@Public()
 // Monitoring probes poll far more often than a human client and must not be
 // throttled into failing, which would look like an outage.
 @SkipThrottle()

@@ -63,6 +63,15 @@ export const envSchema = z.object({
   RATE_LIMIT_TTL_SECONDS: z.coerce.number().int().min(1).default(60),
   RATE_LIMIT_LIMIT: z.coerce.number().int().min(1).default(600),
 
+  /**
+   * The credential endpoints get their own, far tighter budget. Declared here
+   * so it is validated and documented like everything else, but read directly
+   * from process.env at the decorator (see auth.controller.ts) because
+   * @Throttle takes compile-time constants.
+   */
+  AUTH_RATE_LIMIT: z.coerce.number().int().min(1).default(5),
+  AUTH_RATE_LIMIT_TTL_SECONDS: z.coerce.number().int().min(1).default(900),
+
   LOG_LEVEL: z.enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace']).default('info'),
   SWAGGER_ENABLED: z.stringbool().default(false),
 });
