@@ -52,6 +52,10 @@ jobs:
       JWT_REFRESH_SECRET: ci-refresh-secret-at-least-thirty-two-chars
       CORS_ORIGINS: http://localhost:5173
       SWAGGER_ENABLED: 'false'
+      # The auth suite logs in dozens of times from one address. Production
+      # limits would throttle the tests, not an attacker.
+      AUTH_RATE_LIMIT: '2000'
+      RATE_LIMIT_LIMIT: '20000'
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4

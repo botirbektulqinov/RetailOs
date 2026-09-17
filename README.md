@@ -3,8 +3,9 @@
 Retail management platform for small stores, designed to grow into a
 multi-tenant SaaS without a rewrite. NestJS modular monolith on PostgreSQL.
 
-**Current state: Sprint 1 — engineering foundation.** No business endpoints
-exist yet; see [Roadmap](#roadmap).
+**Current state: Sprint 2 — identity, tenancy and RBAC.** Authentication,
+organizations, stores, employees, roles and permissions are implemented. No
+selling, catalog or inventory endpoints yet; see [Roadmap](#roadmap).
 
 The approved design is [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and it is
 the source of truth for every decision below. Section references like
@@ -51,7 +52,7 @@ cp .env.example .env          # defaults work as-is for local development
 
 npm run docker:up             # starts PostgreSQL on port 55432
 npm run prisma:migrate        # applies migrations, generates the client
-npm run seed                  # verifies the schema is reachable
+npm run seed                  # system roles + a demo organization
 
 npm run start:dev
 ```
@@ -131,6 +132,16 @@ npm run test:cov        # + coverage; money has a hard 95% floor
 npm run test:e2e        # HTTP tests — REQUIRES a running database
 ```
 
+The e2e suite exercises authentication, RBAC and tenant isolation against real
+PostgreSQL, so it needs the credential rate limits raised or it throttles
+itself out:
+
+```bash
+NODE_ENV=test AUTH_RATE_LIMIT=2000 RATE_LIMIT_LIMIT=20000 npm run test:e2e
+```
+
+That is also exactly how CI runs it.
+
 > Jest runs under `node --experimental-vm-modules` because NestJS 12 ships as
 > ESM. The flag is already in the npm scripts; run tests through npm, not by
 > invoking `jest` directly.
@@ -158,6 +169,11 @@ npm run prisma:reset           # DESTRUCTIVE: drops and recreates. Never in prod
 - Prisma cannot express CHECK constraints, generated columns, partial unique
   indexes or triggers — several of which *are* the business rules (*§6.2*).
   Those go in a hand-written migration committed alongside the generated one.
+- **Review every generated migration for drift deletions.** Prisma does not
+  know about the hand-written constraints, so it proposes DROP statements for
+  them in the *next* migration. `20260917095300_audit_actor_restrict` had four
+  composite foreign keys and two trigram indexes stripped out by hand before
+  it was applied.
 
 ---
 
@@ -237,6 +253,172 @@ rules.
 
 ---
 
+## Authentication
+
+### The flow
+
+```
+POST /api/v1/auth/login        phone + password  ->  access + refresh token
+     |
+     |  Authorization: Bearer <access>        15 minutes
+     |
+POST /api/v1/auth/refresh      refresh token   ->  NEW access + NEW refresh
+POST /api/v1/auth/logout       revoke this session
+POST /api/v1/auth/logout-all   revoke every session on every device
+```
+
+**Login is by phone, not email.** The design's auth screens are phone-first
+(`+998 90 123 45 67`) and the employees screen searches by name or phone, so
+`phone` is the identifier and `email` is optional contact detail. Any format is
+accepted — the server normalises to E.164 before looking anything up, so
+`+998901234567`, `+998 90 123 45 67` and `901234567` all resolve to the same
+account.
+
+### Demo accounts (DEVELOPMENT ONLY)
+
+`npm run seed` creates the fictional organization **Navro'z Market** with one
+store (`FILIAL-017 - RetailOS Chorsu`) and one user per role. It prints the
+credentials on every run and refuses to create them when `NODE_ENV=production`.
+
+| Phone | Password | Role | Name |
+|---|---|---|---|
+| `+998901234567` | `RetailOS2026` | Administrator | Dilshod Karimov |
+| `+998901234568` | `RetailOS2026` | Menejer | Sevara Tursunova |
+| `+998901234569` | `RetailOS2026` | Kassir | Madina Aliyeva |
+| `+998901234570` | `RetailOS2026` | Omborchi | Aziz Rasulov |
+
+**These are throwaway development credentials.** Never use them anywhere real.
+
+### Trying it
+
+```bash
+# 1. Log in
+curl -s -X POST http://localhost:3000/api/v1/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"phone":"+998 90 123 45 67","password":"RetailOS2026","rememberDevice":true}'
+
+# 2. Use the access token
+TOKEN=<accessToken from step 1>
+curl -s http://localhost:3000/api/v1/auth/me -H "Authorization: Bearer $TOKEN"
+
+# 3. Refresh (this revokes the refresh token you just used)
+curl -s -X POST http://localhost:3000/api/v1/auth/refresh \
+  -H 'Content-Type: application/json' -d '{"refreshToken":"<refreshToken>"}'
+
+# 4. Log out
+curl -s -X POST http://localhost:3000/api/v1/auth/logout \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' -d '{"refreshToken":"<refreshToken>"}'
+```
+
+### Tokens
+
+| | Access | Refresh |
+|---|---|---|
+| Format | JWT, HS256 | opaque random, **SHA-256 hashed at rest** |
+| Lifetime | 15 minutes | 30 days, or 12 hours without "Eslab qolish" |
+| Carries | user, org, store, role, `tv`, `pv` — never a permission list | nothing; it is a database lookup |
+| Revocation | `tokenVersion` mismatch, checked on every request | delete the row |
+
+**Rotation with reuse detection.** Every refresh issues a new token and revokes
+the old one. Presenting an already-rotated token means it was captured, so the
+whole session family is revoked and the legitimate holder must sign in again.
+
+**Permissions are not in the token.** They are resolved per request from the
+membership's current role, cached by `roleId:permissionVersion`. Editing a role
+takes effect on the **very next request** — nobody is forced to log in again,
+and a revoked permission is never honoured for the rest of a token's lifetime.
+
+### Password policy
+
+Straight from the "Yangi parol yarating" screen: **at least 8 characters** and
+**at least one digit or symbol**, plus a small common-password blocklist.
+Hashing is Argon2id (19 MiB, t=2, p=1).
+
+**Changing a password revokes every session, including the one that requested
+it.** You change a password when you think it was exposed, so leaving other
+devices signed in would defeat the point. The client re-authenticates with the
+new password immediately.
+
+---
+
+## Roles and permissions
+
+Four system roles, seeded per organization, matching the "STANDART ROLLAR" list
+on the roles screen:
+
+| Code | Name | Description | Editable |
+|---|---|---|---|
+| `ADMIN` | Administrator | Barcha bo'limlar | no — an org that can strip its own admin can lock itself out |
+| `MANAGER` | Menejer | Hisobot va boshqaruv | yes |
+| `CASHIER` | Kassir | Savdo va cheklar | yes |
+| `WAREHOUSE` | Omborchi | Mahsulot va ombor | yes |
+
+Custom roles are ordinary rows (`POST /api/v1/roles`).
+
+**Permissions are a typed constant in code**
+([`src/rbac/permissions.ts`](src/rbac/permissions.ts)), not a database table. A
+permission no guard references is meaningless, and a guard naming a permission
+that does not exist should be a compile error rather than a check that is
+silently false forever. Roles store permission strings in an array.
+
+```ts
+@RequirePermissions('sales.refund')   // misspelling this does not compile
+@Post(':id/returns')
+createReturn() {}
+```
+
+Matching supports `group.*` and `*`. **Role names are never checked anywhere** —
+`if (role === 'MANAGER')` makes custom roles unusable and hides authorization
+from the one place that is audited.
+
+`GET /api/v1/roles/permissions/catalogue` returns the whole catalogue with
+Uzbek labels and groups, which is what the permissions screen renders.
+
+---
+
+## Organization and store context
+
+```
+Organization  (the tenant boundary)
+  |
+  +-- Store                     a branch; "FILIAL #017"
+        |
+        +-- StoreMembership     (user, store, role)
+```
+
+A user's authority is **per store**. The same person can be a manager at one
+branch and a cashier at another, which a `role` column on the user cannot
+express — and which becomes a painful migration once sales reference the role.
+
+**The organization is never read from the request.** Not from the body, not
+from a query parameter, not from a path. It is derived from the signed access
+token and re-validated against the database on every request. That is why there
+is no `GET /organizations/:id` — only `GET /organizations/current`.
+
+Store context lives inside the token too. `POST /api/v1/auth/switch-store`
+re-mints the access token after verifying membership; `GET /api/v1/stores`
+lists only the stores the caller actually belongs to.
+
+### Three layers of isolation
+
+1. **Never trusted from the client** — org, store, user and role come only from
+   the verified token.
+2. **A Prisma client extension**
+   ([`src/common/tenant/tenant-extension.ts`](src/common/tenant/tenant-extension.ts))
+   injects `organizationId` into every read and create, and **refuses** a
+   single-row operation targeted by bare `id`. Deliberate cross-tenant work goes
+   through `prisma.asSystem()`, which is named to be obvious in review.
+3. **Composite foreign keys** — `store_membership` references
+   `(organization_id, user_id)`, `(organization_id, store_id)` and
+   `(organization_id, role_id)`, so a cross-organization membership is
+   impossible at the database level even if every application check is removed.
+
+Cross-tenant reads return **404, not 403**: confirming that another tenant's row
+exists is itself a leak.
+
+---
+
 ## Foundation behaviour worth knowing
 
 **API versioning.** URI-based: every route lives under `/api/v1/...`. The
@@ -291,8 +473,8 @@ Sprint 1 is the foundation. Phases follow *§33 Implementation order*:
 | Sprint | Contents | Gate |
 |---|---|---|
 | **1 ✅** | Foundation: config, Prisma, errors, logging, health, Docker, tests | `docker compose up` serves `/health`; money tests green |
-| **2** | Tenancy & auth: Organization, Store, Warehouse, User, Role, StoreMembership, JWT + refresh rotation, guard chain, Prisma tenant extension, audit service | **the tenant-isolation suite passes** — nothing proceeds until it does |
-| 3 | Catalog: Category, Product, ProductVariant, barcode lookup, search |
+| **2 ✅** | Tenancy & auth: Organization, Store, Warehouse, User, Role, StoreMembership, JWT + refresh rotation, guard chain, Prisma tenant extension, audit service | the tenant-isolation suite passes |
+| **3** | Catalog: Category, Product, ProductVariant, barcode lookup, search |
 | 4 | Inventory core: levels, movements, the single `apply()` write path |
 | 5 | Cash register: registers, shifts, movements |
 | 6 | Sales / POS: pricing pipeline, checkout transaction, payments, idempotency |
