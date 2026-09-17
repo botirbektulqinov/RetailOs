@@ -1,8 +1,8 @@
 // RetailOS — Prisma schema.
 //
-// Sprint 1 scope: foundation only. No domain models are declared yet; the full
-// draft lives in prisma/schema.draft.prisma and is promoted model-by-model as
-// each sprint lands (see docs/ARCHITECTURE.md §33 "Implementation order").
+// Sprint 2 scope: identity, tenancy, store context and RBAC. Catalog,
+// inventory and selling models stay in prisma/schema.draft.prisma and are
+// promoted by the sprint that implements them (docs/ARCHITECTURE.md §33).
 //
 // Naming convention (docs/ARCHITECTURE.md §5.1):
 //   - Prisma models  PascalCase, fields camelCase
@@ -10,6 +10,10 @@
 //   - enums          SCREAMING_SNAKE values
 // The connection URL lives in prisma.config.ts (Prisma 7 no longer allows
 // `url` in the schema); the runtime connects through the pg driver adapter.
+//
+// Constraints Prisma cannot express — partial unique indexes, CHECKs, the
+// append-only trigger on audit_log — live in the hand-written portion of the
+// migration. See docs/ARCHITECTURE.md §6.2.
 
 generator client {
   provider        = "prisma-client-js"
@@ -19,4 +23,347 @@ generator client {
 datasource db {
   provider   = "postgresql"
   extensions = [pgcrypto, citext, pg_trgm]
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Enums
+// ──────────────────────────────────────────────────────────────────────────
+
+enum OrganizationStatus {
+  ACTIVE
+  SUSPENDED
+}
+
+enum EntityStatus {
+  ACTIVE
+  INACTIVE
+}
+
+/// SUSPENDED is distinct from INACTIVE: inactive is an ordinary "not working
+/// here right now", suspended is a security action. Both block login; only the
+/// reason and who may reverse it differ.
+enum UserStatus {
+  ACTIVE
+  INACTIVE
+  SUSPENDED
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Tenancy
+// ──────────────────────────────────────────────────────────────────────────
+
+model Organization {
+  id           String             @id @default(uuid()) @db.Uuid
+  name         String
+  slug         String             @unique
+  currencyCode String             @default("UZS") @map("currency_code") @db.Char(3)
+  status       OrganizationStatus @default(ACTIVE)
+
+  /// Seat limit. The design's employees screen renders "8 / 10 foydalanuvchi
+  /// band", so the limit is a real product concept, not a billing hook.
+  maxUsers Int @default(10) @map("max_users")
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  settings    OrganizationSettings?
+  stores      Store[]
+  users       User[]
+  roles       Role[]
+  memberships StoreMembership[]
+  auditLogs   AuditLog[]
+
+  @@map("organization")
+}
+
+model OrganizationSettings {
+  organizationId      String  @id @map("organization_id") @db.Uuid
+  currencyExponent    Int     @default(0) @map("currency_exponent") @db.SmallInt
+  cashRoundingUnit    BigInt  @default(0) @map("cash_rounding_unit")
+  allowNegativeStock  Boolean @default(false) @map("allow_negative_stock")
+  defaultDebtTermDays Int     @default(30) @map("default_debt_term_days") @db.SmallInt
+  loyaltyEarnPercent  Decimal @default(0) @map("loyalty_earn_percent") @db.Decimal(5, 2)
+  loyaltyPointValue   BigInt  @default(1) @map("loyalty_point_value")
+  returnWindowDays    Int     @default(14) @map("return_window_days") @db.SmallInt
+  timezone            String  @default("Asia/Tashkent")
+  locale              String  @default("uz-UZ")
+  version             Int     @default(0)
+
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@map("organization_settings")
+}
+
+model Store {
+  id             String @id @default(uuid()) @db.Uuid
+  organizationId String @map("organization_id") @db.Uuid
+
+  /// Human branch code. The design shows "FILIAL #017" on the store screen.
+  code    String
+  name    String
+  address String?
+  phone   String?
+
+  /// "Rekvizitlar" block on the store screen: legal entity name, STIR (the
+  /// Uzbek taxpayer identification number) and opening hours.
+  legalName    String? @map("legal_name")
+  taxId        String? @map("tax_id")
+  workingHours String? @map("working_hours")
+
+  /// Stores inherit the organization's timezone unless they override it — a
+  /// chain can span Tashkent and Nukus.
+  timezone String?
+
+  status     EntityStatus @default(ACTIVE)
+  archivedAt DateTime?    @map("archived_at") @db.Timestamptz(6)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  organization Organization      @relation(fields: [organizationId], references: [id])
+  warehouses   Warehouse[]
+  memberships  StoreMembership[]
+
+  // Every tenant model carries this compound unique so a scoped lookup can
+  // never be written as a bare findUnique({ where: { id } }) — see §4.3.
+  @@unique([organizationId, id])
+  @@index([organizationId, status])
+  @@map("store")
+}
+
+/// Stock lives in a warehouse, never directly in a store. Introduced now, with
+/// one auto-created per store, because retrofitting warehouse_id onto a live
+/// inventory ledger later would mean migrating every movement ever written.
+model Warehouse {
+  id             String  @id @default(uuid()) @db.Uuid
+  organizationId String  @map("organization_id") @db.Uuid
+  storeId        String? @map("store_id") @db.Uuid
+
+  code      String
+  name      String
+  isDefault Boolean @default(false) @map("is_default")
+
+  /// null = inherit organization_settings.allow_negative_stock
+  allowNegativeStock Boolean?  @map("allow_negative_stock")
+  archivedAt         DateTime? @map("archived_at") @db.Timestamptz(6)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  store Store? @relation(fields: [storeId], references: [id])
+
+  @@unique([organizationId, id])
+  @@index([organizationId, storeId])
+  @@map("warehouse")
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Identity
+// ──────────────────────────────────────────────────────────────────────────
+
+model User {
+  id             String @id @default(uuid()) @db.Uuid
+  organizationId String @map("organization_id") @db.Uuid
+
+  /// The login identifier. The design's auth flow is phone-first (+998 …) and
+  /// the employees screen searches "Ism yoki telefon bo'yicha", so phone is
+  /// required and unique; email is optional contact detail.
+  /// Stored E.164 normalised (+998901234567) so lookup is exact.
+  phone    String
+  email    String? @db.Citext
+  fullName String  @map("full_name")
+
+  passwordHash String @map("password_hash")
+
+  /// Drives "90 kun oldin yangilangan" on the security screen.
+  passwordChangedAt DateTime @default(now()) @map("password_changed_at") @db.Timestamptz(6)
+
+  /// Bumped on password change, deactivation and role change. Every issued
+  /// access token carries it, so a stale token is rejected on its next request
+  /// instead of living out its 15 minutes.
+  tokenVersion Int @default(0) @map("token_version")
+
+  /// The security screen's "Ikki bosqichli himoya · SMS kod orqali" toggle.
+  /// Stored now; SMS delivery is deferred (see README security notes).
+  twoFactorEnabled Boolean @default(false) @map("two_factor_enabled")
+
+  status      UserStatus @default(ACTIVE)
+  lastLoginAt DateTime?  @map("last_login_at") @db.Timestamptz(6)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  organization  Organization      @relation(fields: [organizationId], references: [id])
+  memberships   StoreMembership[]
+  refreshTokens RefreshToken[]
+  auditLogs     AuditLog[]
+
+  @@unique([organizationId, id])
+  // Phone is globally unique, not per-organization: login is a single field
+  // with no tenant selector, so the same number cannot identify two accounts.
+  // Documented in ARCHITECTURE §35.4.
+  @@unique([phone])
+  @@index([organizationId, status])
+  @@index([organizationId, fullName])
+  @@map("app_user")
+}
+
+/// A user's authority is per store. The same person can be MANAGER at one
+/// branch and CASHIER at another, which a role column on User cannot express
+/// and which becomes a painful migration once sales reference the role.
+model StoreMembership {
+  id             String @id @default(uuid()) @db.Uuid
+  organizationId String @map("organization_id") @db.Uuid
+  userId         String @map("user_id") @db.Uuid
+  storeId        String @map("store_id") @db.Uuid
+  roleId         String @map("role_id") @db.Uuid
+
+  /// The store a fresh session lands in when none is requested.
+  isPrimary Boolean      @default(false) @map("is_primary")
+  status    EntityStatus @default(ACTIVE)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+  user         User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  store        Store        @relation(fields: [storeId], references: [id])
+  role         Role         @relation(fields: [roleId], references: [id])
+
+  @@unique([userId, storeId])
+  @@unique([organizationId, id])
+  @@index([organizationId, storeId, status])
+  @@index([roleId])
+  @@map("store_membership")
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// RBAC
+// ──────────────────────────────────────────────────────────────────────────
+
+/// Permissions are a typed constant in code (src/rbac/permissions.ts), not a
+/// table: a permission no guard references is meaningless, and a guard naming
+/// a permission that does not exist should be a compile error rather than a
+/// silently-false check. See ARCHITECTURE §2.2 and §20.1.
+model Role {
+  id             String @id @default(uuid()) @db.Uuid
+  organizationId String @map("organization_id") @db.Uuid
+
+  /// Stable machine code (ADMIN, MANAGER, CASHIER, WAREHOUSE, or a slug for
+  /// custom roles). Authorization never reads this — it reads `permissions`.
+  code String
+
+  /// Display name and one-line summary, both shown on the roles screen
+  /// ("Administrator" / "Barcha bo'limlar").
+  name        String
+  description String?
+
+  permissions String[] @default([])
+
+  /// System roles are seeded per organization and cannot be deleted. ADMIN
+  /// additionally cannot have its permissions edited.
+  isSystem Boolean @default(false) @map("is_system")
+
+  /// Bumped whenever `permissions` changes. It is part of the permission cache
+  /// key and is carried in the access token, so a revoked permission takes
+  /// effect on the very next request rather than after the token expires.
+  permissionVersion Int @default(0) @map("permission_version")
+
+  version Int @default(0)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  organization Organization      @relation(fields: [organizationId], references: [id])
+  memberships  StoreMembership[]
+
+  @@unique([organizationId, code])
+  @@unique([organizationId, id])
+  @@map("role")
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Sessions
+// ──────────────────────────────────────────────────────────────────────────
+
+/// One row per active session. The security screen lists these as "Faol
+/// qurilmalar · 3 ta qurilma" and offers "Barcha qurilmalardan chiqish".
+model RefreshToken {
+  id             String @id @default(uuid()) @db.Uuid
+  organizationId String @map("organization_id") @db.Uuid
+  userId         String @map("user_id") @db.Uuid
+
+  /// SHA-256 of the opaque token. The token itself is never stored, so a
+  /// database leak does not hand over live sessions.
+  tokenHash String @unique @map("token_hash")
+
+  /// Rotation family. Presenting an already-rotated token means it was stolen,
+  /// so the whole family is revoked at once (§29.2).
+  familyId     String  @map("family_id") @db.Uuid
+  replacedById String? @map("replaced_by_id") @db.Uuid
+
+  /// Coarse label derived from the User-Agent ("iPhone · Safari"). Deliberately
+  /// not a fingerprint — enough to recognise a device, not to track one.
+  deviceName String? @map("device_name")
+  ip         String?
+
+  expiresAt  DateTime  @map("expires_at") @db.Timestamptz(6)
+  lastUsedAt DateTime  @default(now()) @map("last_used_at") @db.Timestamptz(6)
+  revokedAt  DateTime? @map("revoked_at") @db.Timestamptz(6)
+  revokedBy  String?   @map("revoked_by")
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, revokedAt])
+  @@index([familyId])
+  @@index([expiresAt])
+  @@map("refresh_token")
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Audit
+// ──────────────────────────────────────────────────────────────────────────
+
+/// Append-only. UPDATE and DELETE are blocked by trigger in the migration.
+model AuditLog {
+  id             BigInt  @id @default(autoincrement())
+  organizationId String  @map("organization_id") @db.Uuid
+  storeId        String? @map("store_id") @db.Uuid
+
+  /// null = the system acted (cron, webhook), not a person.
+  actorUserId String? @map("actor_user_id") @db.Uuid
+
+  /// noun.verb, past tense: 'auth.login_failed', 'role.permissions_changed'.
+  action     String
+  entityType String  @map("entity_type")
+  entityId   String? @map("entity_id")
+
+  /// Explicitly constructed, never a dumped DTO — that is how secrets end up
+  /// in a table nobody can delete from (§21.4).
+  metadata Json @default("{}")
+
+  ip        String?
+  userAgent String? @map("user_agent")
+  requestId String? @map("request_id")
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+
+  /// RESTRICT, not the implicit SET NULL: nulling the actor is an UPDATE on an
+  /// append-only table and the trigger rejects it, which surfaces as a
+  /// baffling error at the delete site. Users are never deleted in this
+  /// product anyway — they are deactivated, so their sales and their audit
+  /// trail keep naming them.
+  actor        User?        @relation(fields: [actorUserId], references: [id], onDelete: Restrict)
+
+  @@index([organizationId, createdAt(sort: Desc)])
+  @@index([organizationId, entityType, entityId, createdAt(sort: Desc)])
+  @@index([organizationId, actorUserId, createdAt(sort: Desc)])
+  @@index([organizationId, action, createdAt(sort: Desc)])
+  @@map("audit_log")
 }
