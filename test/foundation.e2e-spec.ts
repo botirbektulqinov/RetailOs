@@ -7,6 +7,7 @@ import request from 'supertest';
 import type { App } from 'supertest/types';
 
 import { AppModule } from '../src/app.module';
+import { Public } from '../src/auth/decorators/public.decorator';
 import { BusinessRuleException } from '../src/common/exceptions/business-rule.exception';
 import { ListQueryDto } from '../src/common/dto/list-query.dto';
 import { applyGlobalSetup } from '../src/bootstrap';
@@ -31,6 +32,10 @@ class ProbeDto {
 }
 
 @Controller('probe')
+// Sprint 2 made authentication the default for every route. These probes test
+// the pipeline BELOW auth — validation, error shaping, serialization — so they
+// opt out explicitly rather than carrying a token.
+@Public()
 class ProbeController {
   @Post()
   create(@Body() body: ProbeDto): { received: ProbeDto } {
