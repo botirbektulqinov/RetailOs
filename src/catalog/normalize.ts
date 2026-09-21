@@ -94,7 +94,7 @@ export function mapCatalogUniqueViolation(error: unknown): never {
  * every duplicate SKU surfaced as a generic DUPLICATE_RESOURCE.
  */
 function violatedConstraint(error: Prisma.PrismaClientKnownRequestError): string {
-  const meta = (error.meta ?? {}) as Record<string, unknown>;
+  const meta = error.meta ?? {};
 
   const target = meta['target'];
   if (Array.isArray(target)) return target.join(',').toLowerCase();

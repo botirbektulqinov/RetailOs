@@ -15,6 +15,7 @@ import { AppConfig, ConfigModule } from './config/config.module';
 import { DatabaseModule } from './database/prisma.module';
 import { EmployeesModule } from './employees/employees.module';
 import { HealthModule } from './health/health.module';
+import { InventoryModule } from './inventory/inventory.module';
 import { OrganizationsModule } from './organizations/organizations.module';
 import { RbacModule } from './rbac/rbac.module';
 import { StoresModule } from './stores/stores.module';
@@ -56,6 +57,7 @@ import { StoresModule } from './stores/stores.module';
     RbacModule,
     EmployeesModule,
     CatalogModule,
+    InventoryModule,
     HealthModule,
   ],
   providers: [

@@ -31,6 +31,13 @@ const TENANT_MODELS = new Set<string>([
   'Category',
   'Product',
   'ProductVariant',
+  'InventoryLevel',
+  'InventoryMovement',
+  'InventoryCount',
+  'InventoryCountItem',
+  'StockTransfer',
+  'StockTransferItem',
+  'DocumentCounter',
 ]);
 
 /** Operations whose `where` must be narrowed to the tenant. */
