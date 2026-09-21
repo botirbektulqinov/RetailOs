@@ -198,6 +198,22 @@ export async function dropTestOrg(db: PrismaClient, organizationId: string): Pro
     await db.$executeRaw`ALTER TABLE audit_log ENABLE TRIGGER tg_audit_log_immutable`;
   }
 
+  // Selling before inventory: sale lines reference variants, allocations
+  // reference payments and receivables, and payment_allocation is append-only
+  // for the application exactly like the movement ledger.
+  await db.$executeRaw`ALTER TABLE payment_allocation DISABLE TRIGGER tg_payment_allocation_immutable`;
+  try {
+    await db.$executeRaw`DELETE FROM payment_allocation WHERE organization_id = ${organizationId}::uuid`;
+  } finally {
+    await db.$executeRaw`ALTER TABLE payment_allocation ENABLE TRIGGER tg_payment_allocation_immutable`;
+  }
+  await db.customerReceivable.deleteMany({ where: { organizationId } });
+  await db.payment.deleteMany({ where: { organizationId } });
+  await db.saleItem.deleteMany({ where: { organizationId } });
+  await db.sale.deleteMany({ where: { organizationId } });
+  await db.customer.deleteMany({ where: { organizationId } });
+  await db.idempotencyRecord.deleteMany({ where: { organizationId } });
+
   // Inventory before catalog: levels and movements reference variants and
   // warehouses with ON DELETE RESTRICT. inventory_movement is append-only for
   // the application, so its trigger comes off for exactly one statement — a

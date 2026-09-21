@@ -492,6 +492,43 @@ async function seedStock(client: PrismaClient): Promise<string> {
   return `${pending.length} new opening balance(s)`;
 }
 
+/**
+ * A handful of demo customers, so the credit path has somebody to owe money.
+ *
+ * Kept here rather than in the catalog step because a customer is not a
+ * product; kept minimal because Sprint 6 owns the CRM and will want to add to
+ * these rather than work around them.
+ */
+async function seedCustomers(client: PrismaClient): Promise<string> {
+  const organization = await client.organization.findUnique({
+    where: { slug: DEMO.organization.slug },
+    select: { id: true },
+  });
+  if (!organization) return 'skipped (no demo organization)';
+
+  const demoCustomers = [
+    { fullName: 'Dilnoza Karimova', phone: '+998901112233', creditLimit: 2_000_000n },
+    { fullName: 'Bobur Aliyev', phone: '+998901112244', creditLimit: 500_000n },
+    { fullName: 'Nodira Yusupova', phone: '+998901112255', creditLimit: null },
+  ];
+
+  let created = 0;
+  for (const customer of demoCustomers) {
+    const existing = await client.customer.findFirst({
+      where: { organizationId: organization.id, phone: customer.phone },
+      select: { id: true },
+    });
+    if (existing) continue;
+
+    await client.customer.create({
+      data: { organizationId: organization.id, ...customer },
+    });
+    created += 1;
+  }
+
+  return `${created} new customer(s)`;
+}
+
 interface SeedStep {
   name: string;
   /** true when the step may run against a production database. */
@@ -504,6 +541,7 @@ const steps: SeedStep[] = [
   { name: 'demo-data', productionSafe: false, run: seedDemo },
   { name: 'demo-catalog', productionSafe: false, run: seedCatalog },
   { name: 'demo-stock', productionSafe: false, run: seedStock },
+  { name: 'demo-customers', productionSafe: false, run: seedCustomers },
 ];
 
 async function main(): Promise<void> {
