@@ -125,6 +125,7 @@ model Store {
   organization Organization      @relation(fields: [organizationId], references: [id])
   warehouses   Warehouse[]
   memberships  StoreMembership[]
+  sales        Sale[]
 
   // Every tenant model carries this compound unique so a scoped lookup can
   // never be written as a bare findUnique({ where: { id } }) — see §4.3.
@@ -517,6 +518,7 @@ model ProductVariant {
   movements     InventoryMovement[]
   countItems    InventoryCountItem[]
   transferItems StockTransferItem[]
+  saleItems     SaleItem[]
 
   @@unique([organizationId, id])
   @@index([organizationId, barcode])
@@ -780,4 +782,359 @@ model DocumentCounter {
 
   @@id([organizationId, storeId, documentType, periodKey])
   @@map("document_counter")
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Selling (Sprint 5)
+// ──────────────────────────────────────────────────────────────────────────
+
+enum SaleStatus {
+  DRAFT
+  COMPLETED
+  CANCELLED
+}
+
+/// Derived in the return transaction from returned vs sold quantity, and
+/// denormalised purely so the sales list can filter without a subquery. The
+/// original sale's own status is never rewritten by a return.
+enum SaleReturnStatus {
+  NONE
+  PARTIAL
+  FULL
+}
+
+/// IN is customer → store, OUT is store → customer. `amount` is always
+/// positive and the direction carries the sign, so SUM(amount) stays
+/// meaningful behind a WHERE instead of depending on every writer to get a
+/// minus sign right.
+enum PaymentDirection {
+  IN
+  OUT
+}
+
+enum PaymentStatus {
+  COMPLETED
+  VOIDED
+}
+
+/// A PostgreSQL enum, not a lookup table. Adding a provider costs one value;
+/// a table with is_cash / affects_drawer / requires_provider flags would add
+/// two joins to the checkout path to express the same three branches.
+enum PaymentMethod {
+  CASH
+  CARD
+  CLICK
+  PAYME
+  UZUM
+  TRANSFER
+  LOYALTY
+  OTHER
+}
+
+enum ReceivableOrigin {
+  SALE
+  OPENING_BALANCE
+  MANUAL
+  EXCHANGE
+}
+
+enum ReceivableStatus {
+  OPEN
+  PARTIALLY_PAID
+  PAID
+  WRITTEN_OFF
+}
+
+enum IdempotencyStatus {
+  IN_PROGRESS
+  COMPLETED
+}
+
+/// Minimal now — Sprint 6 adds groups, credit limits and the CRM screens.
+/// Introduced here because a credit sale needs somebody to owe the money, and
+/// a `customer_id` with no table behind it is a foreign key waiting to be
+/// wrong.
+model Customer {
+  id             String @id @default(uuid()) @db.Uuid
+  organizationId String @map("organization_id") @db.Uuid
+
+  fullName String  @map("full_name")
+  phone    String?
+  email    String? @db.Citext
+  address  String?
+  notes    String?
+
+  /// null = no customer-specific limit. Sprint 6 adds the group fallback.
+  creditLimit BigInt? @map("credit_limit")
+
+  status     EntityStatus @default(ACTIVE)
+  archivedAt DateTime?    @map("archived_at") @db.Timestamptz(6)
+
+  createdBy String?  @map("created_by") @db.Uuid
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  sales       Sale[]
+  payments    Payment[]
+  receivables CustomerReceivable[]
+
+  @@unique([organizationId, id])
+  @@index([organizationId, fullName])
+  @@index([organizationId, phone])
+  @@map("customer")
+}
+
+/// A completed sale is a historical document. Every figure on it is stored,
+/// never recomputed at read time: a receipt reprinted next year must say what
+/// it said on the day, whatever has happened to the price list since.
+model Sale {
+  id             String @id @default(uuid()) @db.Uuid
+  organizationId String @map("organization_id") @db.Uuid
+  storeId        String @map("store_id") @db.Uuid
+
+  /// Which stock this sale drew from. Recorded on the sale, not inferred at
+  /// return time, because a store's default warehouse can change.
+  warehouseId String @map("warehouse_id") @db.Uuid
+
+  customerId String? @map("customer_id") @db.Uuid
+
+  /// Human receipt number, unique per store.
+  saleNumber String @map("sale_number")
+
+  status       SaleStatus       @default(DRAFT)
+  returnStatus SaleReturnStatus @default(NONE) @map("return_status")
+
+  /// All money is BIGINT minor units (§8). Every one of these is computed by
+  /// the server; none is ever read from the request.
+  subtotalAmount      BigInt @default(0) @map("subtotal_amount")
+  orderDiscountAmount BigInt @default(0) @map("order_discount_amount")
+  taxAmount           BigInt @default(0) @map("tax_amount")
+  roundingAdjustment  BigInt @default(0) @map("rounding_adjustment")
+  totalAmount         BigInt @default(0) @map("total_amount")
+
+  /// Sum of this sale's payment allocations, maintained inside the checkout
+  /// transaction so the CHECK below can hold.
+  paidAmount BigInt @default(0) @map("paid_amount")
+
+  /// The part pushed onto a receivable. paid + credit = total, or the sale is
+  /// not COMPLETED — a CHECK, not a convention.
+  creditAmount   BigInt @default(0) @map("credit_amount")
+  refundedAmount BigInt @default(0) @map("refunded_amount")
+
+  /// COGS snapshot: the sum of the lines' unit_cost x quantity at the moment
+  /// of sale. Margin is then a subtraction on stored values rather than a
+  /// lookup of a cost that has since moved.
+  costAmount BigInt @default(0) @map("cost_amount")
+
+  discountReason String? @map("discount_reason")
+  note           String?
+
+  createdBy   String    @map("created_by") @db.Uuid
+  completedAt DateTime? @map("completed_at") @db.Timestamptz(6)
+
+  cancelledAt  DateTime? @map("cancelled_at") @db.Timestamptz(6)
+  cancelledBy  String?   @map("cancelled_by") @db.Uuid
+  cancelReason String?   @map("cancel_reason")
+
+  /// Offline hooks (§10.5). Four columns and a header are the whole offline
+  /// story; they cost nothing today and make a replayed queue safe later.
+  clientId        String?   @map("client_id") @db.Uuid
+  clientCreatedAt DateTime? @map("client_created_at") @db.Timestamptz(6)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  store       Store               @relation(fields: [storeId], references: [id])
+  customer    Customer?           @relation(fields: [customerId], references: [id])
+  items       SaleItem[]
+  allocations PaymentAllocation[]
+  receivable  CustomerReceivable?
+
+  @@unique([organizationId, id])
+  @@unique([organizationId, storeId, saleNumber])
+  @@index([organizationId, storeId, completedAt(sort: Desc)])
+  @@index([organizationId, customerId, completedAt(sort: Desc)])
+  @@index([organizationId, status])
+  @@index([organizationId, createdBy, completedAt(sort: Desc)])
+  @@map("sale")
+}
+
+model SaleItem {
+  id               String @id @default(uuid()) @db.Uuid
+  organizationId   String @map("organization_id") @db.Uuid
+  saleId           String @map("sale_id") @db.Uuid
+  productVariantId String @map("product_variant_id") @db.Uuid
+
+  /// What the receipt said. Immune to a later rename, which is the entire
+  /// point: a customer holding a printed receipt must be able to match it.
+  nameSnapshot String @map("name_snapshot")
+  skuSnapshot  String @map("sku_snapshot")
+
+  quantity Decimal @db.Decimal(14, 3)
+
+  /// Server-resolved from the catalogue, or overridden with permission.
+  unitPrice   BigInt @map("unit_price")
+  grossAmount BigInt @map("gross_amount")
+
+  lineDiscountAmount     BigInt @default(0) @map("line_discount_amount")
+  allocatedOrderDiscount BigInt @default(0) @map("allocated_order_discount")
+  netAmount              BigInt @map("net_amount")
+
+  /// avg_cost at the moment of sale. Stored per line, because the level's
+  /// average moves with the next delivery.
+  unitCost BigInt @map("unit_cost")
+
+  returnedQuantity Decimal @default(0) @map("returned_quantity") @db.Decimal(14, 3)
+  refundedAmount   BigInt  @default(0) @map("refunded_amount")
+
+  position Int @db.SmallInt
+
+  sale    Sale           @relation(fields: [saleId], references: [id], onDelete: Cascade)
+  variant ProductVariant @relation(fields: [productVariantId], references: [id])
+
+  @@unique([organizationId, id])
+  @@unique([saleId, position])
+  @@index([organizationId, productVariantId])
+  @@map("sale_item")
+}
+
+/// Money moved: how much, by which method. What it settled is in
+/// PaymentAllocation — one payment can pay for several things, and a debt
+/// payment is the same two tables as a sale payment.
+model Payment {
+  id             String  @id @default(uuid()) @db.Uuid
+  organizationId String  @map("organization_id") @db.Uuid
+  storeId        String  @map("store_id") @db.Uuid
+  customerId     String? @map("customer_id") @db.Uuid
+
+  direction PaymentDirection
+  method    PaymentMethod
+
+  /// Always positive; `direction` carries the sign.
+  amount BigInt
+
+  status PaymentStatus @default(COMPLETED)
+
+  /// External transaction id, for the providers that have one. No
+  /// provider-specific column ever reaches the core schema.
+  providerRef  String? @map("provider_ref")
+  providerMeta Json    @default("{}") @map("provider_meta")
+
+  receivedBy String  @map("received_by") @db.Uuid
+  note       String?
+
+  idempotencyKey String? @map("idempotency_key")
+  clientId       String? @map("client_id") @db.Uuid
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  customer    Customer?           @relation(fields: [customerId], references: [id])
+  allocations PaymentAllocation[]
+
+  @@unique([organizationId, id])
+  @@index([organizationId, customerId, createdAt(sort: Desc)])
+  @@index([organizationId, storeId, createdAt(sort: Desc)])
+  @@index([organizationId, method, createdAt(sort: Desc)])
+  @@map("payment")
+}
+
+/// Append-only. Exactly one of sale/receivable/return is set — a CHECK, not a
+/// polymorphic (target_type, target_id) pair, so the database still verifies
+/// that the thing being paid for exists.
+model PaymentAllocation {
+  id             String @id @default(uuid()) @db.Uuid
+  organizationId String @map("organization_id") @db.Uuid
+  paymentId      String @map("payment_id") @db.Uuid
+
+  saleId       String? @map("sale_id") @db.Uuid
+  receivableId String? @map("receivable_id") @db.Uuid
+
+  amount BigInt
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  payment    Payment             @relation(fields: [paymentId], references: [id], onDelete: Cascade)
+  sale       Sale?               @relation(fields: [saleId], references: [id])
+  receivable CustomerReceivable? @relation(fields: [receivableId], references: [id])
+
+  @@unique([organizationId, id])
+  @@index([saleId])
+  @@index([receivableId])
+  @@index([paymentId])
+  @@map("payment_allocation")
+}
+
+/// One document per debt, never a running balance on the customer.
+///
+/// `remaining_amount` is deliberately NOT a column: the architecture proposed
+/// a STORED generated column so it could not drift from its inputs, and not
+/// storing it at all achieves that more simply — nothing stored is nothing
+/// that can drift, and Prisma cannot declare a generated column anyway.
+/// A CHECK keeps paid + written_off within the original, so over-payment is an
+/// error rather than a negative balance.
+model CustomerReceivable {
+  id             String @id @default(uuid()) @db.Uuid
+  organizationId String @map("organization_id") @db.Uuid
+  storeId        String @map("store_id") @db.Uuid
+  customerId     String @map("customer_id") @db.Uuid
+
+  /// Unique: one sale cannot spawn two debts, whatever a retrying client does.
+  saleId String? @unique @map("sale_id") @db.Uuid
+
+  origin ReceivableOrigin @default(SALE)
+
+  originalAmount   BigInt @map("original_amount")
+  paidAmount       BigInt @default(0) @map("paid_amount")
+  writtenOffAmount BigInt @default(0) @map("written_off_amount")
+
+  status ReceivableStatus @default(OPEN)
+
+  issuedAt DateTime  @map("issued_at") @db.Timestamptz(6)
+  dueDate  DateTime  @map("due_date") @db.Date
+  closedAt DateTime? @map("closed_at") @db.Timestamptz(6)
+
+  note String?
+
+  createdBy String   @map("created_by") @db.Uuid
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  customer    Customer            @relation(fields: [customerId], references: [id])
+  sale        Sale?               @relation(fields: [saleId], references: [id])
+  allocations PaymentAllocation[]
+
+  @@unique([organizationId, id])
+  @@index([organizationId, customerId, status])
+  @@index([organizationId, dueDate])
+  @@map("customer_receivable")
+}
+
+/// Written in the SAME transaction as the work it guards, so "the sale
+/// committed but the idempotency record did not" cannot happen (§26.2).
+model IdempotencyRecord {
+  id             String @id @default(uuid()) @db.Uuid
+  organizationId String @map("organization_id") @db.Uuid
+
+  key      String
+  endpoint String
+
+  /// sha256(method + path + canonical body). A different body under the same
+  /// key is a client bug, and answering it with the first response would be
+  /// worse than an error.
+  requestHash String @map("request_hash")
+
+  status IdempotencyStatus @default(IN_PROGRESS)
+
+  responseStatus Int?    @map("response_status")
+  responseBody   Json?   @map("response_body")
+  resourceId     String? @map("resource_id") @db.Uuid
+
+  expiresAt DateTime @map("expires_at") @db.Timestamptz(6)
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@unique([organizationId, key])
+  @@index([expiresAt])
+  @@map("idempotency_record")
 }
