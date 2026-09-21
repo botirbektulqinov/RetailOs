@@ -154,6 +154,12 @@ model Warehouse {
 
   store Store? @relation(fields: [storeId], references: [id])
 
+  levels       InventoryLevel[]
+  movements    InventoryMovement[]
+  counts       InventoryCount[]
+  transfersOut StockTransfer[]     @relation("TransferOut")
+  transfersIn  StockTransfer[]     @relation("TransferIn")
+
   @@unique([organizationId, id])
   @@index([organizationId, storeId])
   @@map("warehouse")
@@ -359,7 +365,7 @@ model AuditLog {
   /// baffling error at the delete site. Users are never deleted in this
   /// product anyway — they are deactivated, so their sales and their audit
   /// trail keep naming them.
-  actor        User?        @relation(fields: [actorUserId], references: [id], onDelete: Restrict)
+  actor User? @relation(fields: [actorUserId], references: [id], onDelete: Restrict)
 
   @@index([organizationId, createdAt(sort: Desc)])
   @@index([organizationId, entityType, entityId, createdAt(sort: Desc)])
@@ -507,9 +513,271 @@ model ProductVariant {
 
   product Product @relation(fields: [productId], references: [id], onDelete: Cascade)
 
+  levels        InventoryLevel[]
+  movements     InventoryMovement[]
+  countItems    InventoryCountItem[]
+  transferItems StockTransferItem[]
+
   @@unique([organizationId, id])
   @@index([organizationId, barcode])
   @@index([organizationId, sku])
   @@index([productId])
   @@map("product_variant")
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Inventory (Sprint 4)
+// ──────────────────────────────────────────────────────────────────────────
+
+/// The ledger's vocabulary — docs/ARCHITECTURE.md §3.4. The sign each type may
+/// carry is enforced by a CHECK in the migration, so a PURCHASE that removes
+/// stock cannot be written even by raw SQL.
+enum InventoryMovementType {
+  INITIAL
+  PURCHASE
+  SALE
+  RETURN
+  ADJUSTMENT
+  DAMAGE
+  WRITE_OFF
+  TRANSFER_OUT
+  TRANSFER_IN
+  COUNT_CORRECTION
+}
+
+enum InventoryCountStatus {
+  DRAFT
+  COUNTING
+  FINALIZED
+  CANCELLED
+}
+
+enum InventoryCountScope {
+  FULL
+  PARTIAL
+  CATEGORY
+}
+
+enum StockTransferStatus {
+  DRAFT
+  SENT
+  RECEIVED
+  CANCELLED
+}
+
+/// The projection — fast to read, rebuildable from the ledger (§9.1).
+///
+/// This is the row every sale locks. It is deliberately narrow: one row per
+/// (warehouse, variant), no history, no joins needed to answer "can I sell
+/// this right now".
+model InventoryLevel {
+  id               String @id @default(uuid()) @db.Uuid
+  organizationId   String @map("organization_id") @db.Uuid
+  warehouseId      String @map("warehouse_id") @db.Uuid
+  productVariantId String @map("product_variant_id") @db.Uuid
+
+  /// NUMERIC(14,3): 1.5 kg of rice is a real quantity. No CHECK (quantity >= 0)
+  /// — negative stock is a per-warehouse policy enforced by the conditional
+  /// UPDATE in InventoryService.apply(), not a blanket constraint.
+  quantity Decimal @default(0) @db.Decimal(14, 3)
+
+  /// Moving weighted average, minor units (§8.6). Recomputed inside the same
+  /// UPDATE that moves the quantity, so the two can never disagree.
+  avgCost BigInt @default(0) @map("avg_cost")
+
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  warehouse Warehouse      @relation(fields: [warehouseId], references: [id])
+  variant   ProductVariant @relation(fields: [productVariantId], references: [id])
+
+  /// The row that gets locked on every sale line.
+  @@unique([warehouseId, productVariantId])
+  @@unique([organizationId, id])
+  @@index([organizationId, productVariantId])
+  @@map("inventory_level")
+}
+
+/// The truth — append-only (§9.1). UPDATE and DELETE are blocked by trigger,
+/// so a careless Prisma call fails loudly instead of silently rewriting the
+/// history that every stock number depends on.
+model InventoryMovement {
+  id               String                @id @default(uuid()) @db.Uuid
+  organizationId   String                @map("organization_id") @db.Uuid
+  warehouseId      String                @map("warehouse_id") @db.Uuid
+  productVariantId String                @map("product_variant_id") @db.Uuid
+  type             InventoryMovementType
+
+  /// Signed. The sign must match the type — see ck_movement_sign.
+  quantityDelta Decimal @map("quantity_delta") @db.Decimal(14, 3)
+
+  /// The level's value after this movement. Makes "what was the stock on
+  /// 3 September" a single indexed row read instead of a running sum.
+  quantityAfter Decimal @map("quantity_after") @db.Decimal(14, 3)
+
+  unitCost BigInt? @map("unit_cost")
+
+  /// The business event that caused this: 'adjustment' | 'inventory_count' |
+  /// 'stock_transfer' | 'sale' | 'purchase' | 'return' | 'onboarding'.
+  sourceType String  @map("source_type")
+  sourceId   String? @map("source_id") @db.Uuid
+
+  reason String?
+  note   String?
+
+  createdBy String?  @map("created_by") @db.Uuid
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  warehouse Warehouse      @relation(fields: [warehouseId], references: [id])
+  variant   ProductVariant @relation(fields: [productVariantId], references: [id])
+
+  @@unique([organizationId, id])
+  @@index([organizationId, productVariantId, createdAt(sort: Desc)])
+  @@index([organizationId, warehouseId, createdAt(sort: Desc)])
+  @@index([organizationId, type, createdAt(sort: Desc)])
+  @@index([sourceType, sourceId])
+  @@map("inventory_movement")
+}
+
+/// A stocktake. Only finalization moves stock (§9.5) — counting itself never
+/// locks the catalogue, because freezing a shop's entire stock for the
+/// duration of a stocktake is not a workable product.
+model InventoryCount {
+  id             String @id @default(uuid()) @db.Uuid
+  organizationId String @map("organization_id") @db.Uuid
+  warehouseId    String @map("warehouse_id") @db.Uuid
+
+  countNumber String               @map("count_number")
+  status      InventoryCountStatus @default(DRAFT)
+  scope       InventoryCountScope  @default(FULL)
+
+  /// Set only when scope = CATEGORY.
+  categoryId String? @map("category_id") @db.Uuid
+
+  startedAt   DateTime? @map("started_at") @db.Timestamptz(6)
+  finalizedAt DateTime? @map("finalized_at") @db.Timestamptz(6)
+  cancelledAt DateTime? @map("cancelled_at") @db.Timestamptz(6)
+
+  createdBy   String  @map("created_by") @db.Uuid
+  finalizedBy String? @map("finalized_by") @db.Uuid
+  note        String?
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  warehouse Warehouse            @relation(fields: [warehouseId], references: [id])
+  items     InventoryCountItem[]
+
+  @@unique([organizationId, countNumber])
+  @@unique([organizationId, id])
+  @@index([organizationId, warehouseId, status])
+  @@map("inventory_count")
+}
+
+model InventoryCountItem {
+  id               String @id @default(uuid()) @db.Uuid
+  organizationId   String @map("organization_id") @db.Uuid
+  inventoryCountId String @map("inventory_count_id") @db.Uuid
+  productVariantId String @map("product_variant_id") @db.Uuid
+
+  /// Snapshotted when the line was generated. Kept for the report — it is
+  /// deliberately NOT what the correction is computed from (§9.5).
+  expectedQuantity Decimal @map("expected_quantity") @db.Decimal(14, 3)
+
+  /// null means "not counted yet", which is not the same as counted zero.
+  /// Conflating the two destroys inventory, so null lines are skipped.
+  countedQuantity Decimal? @map("counted_quantity") @db.Decimal(14, 3)
+
+  /// avg_cost at line generation, so shrinkage can be valued in money.
+  unitCost BigInt? @map("unit_cost")
+
+  countedBy String?   @map("counted_by") @db.Uuid
+  countedAt DateTime? @map("counted_at") @db.Timestamptz(6)
+
+  /// The correction actually applied at finalization. Null until then.
+  appliedDelta Decimal? @map("applied_delta") @db.Decimal(14, 3)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  count   InventoryCount @relation(fields: [inventoryCountId], references: [id], onDelete: Cascade)
+  variant ProductVariant @relation(fields: [productVariantId], references: [id])
+
+  @@unique([inventoryCountId, productVariantId])
+  @@unique([organizationId, id])
+  @@index([organizationId, inventoryCountId])
+  @@map("inventory_count_item")
+}
+
+/// Stock moving between warehouses. Goods in transit belong to neither
+/// warehouse's sellable stock, which is why TRANSFER_OUT lands at send time
+/// rather than at receive (§9.6).
+model StockTransfer {
+  id             String @id @default(uuid()) @db.Uuid
+  organizationId String @map("organization_id") @db.Uuid
+
+  transferNumber  String              @map("transfer_number")
+  fromWarehouseId String              @map("from_warehouse_id") @db.Uuid
+  toWarehouseId   String              @map("to_warehouse_id") @db.Uuid
+  status          StockTransferStatus @default(DRAFT)
+
+  sentAt      DateTime? @map("sent_at") @db.Timestamptz(6)
+  receivedAt  DateTime? @map("received_at") @db.Timestamptz(6)
+  cancelledAt DateTime? @map("cancelled_at") @db.Timestamptz(6)
+
+  createdBy  String  @map("created_by") @db.Uuid
+  sentBy     String? @map("sent_by") @db.Uuid
+  receivedBy String? @map("received_by") @db.Uuid
+  note       String?
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  fromWarehouse Warehouse           @relation("TransferOut", fields: [fromWarehouseId], references: [id])
+  toWarehouse   Warehouse           @relation("TransferIn", fields: [toWarehouseId], references: [id])
+  items         StockTransferItem[]
+
+  @@unique([organizationId, transferNumber])
+  @@unique([organizationId, id])
+  @@index([organizationId, status])
+  @@index([organizationId, fromWarehouseId])
+  @@index([organizationId, toWarehouseId])
+  @@map("stock_transfer")
+}
+
+model StockTransferItem {
+  id               String @id @default(uuid()) @db.Uuid
+  organizationId   String @map("organization_id") @db.Uuid
+  stockTransferId  String @map("stock_transfer_id") @db.Uuid
+  productVariantId String @map("product_variant_id") @db.Uuid
+
+  quantity Decimal @db.Decimal(14, 3)
+
+  /// Shrinkage in transit is real, so received may be less than sent. The
+  /// difference is written off at the source with a reason, never silently
+  /// dropped.
+  receivedQuantity Decimal @default(0) @map("received_quantity") @db.Decimal(14, 3)
+
+  /// Cost travels with the goods, so the destination's moving average is not
+  /// polluted by a zero-cost arrival.
+  unitCost BigInt @default(0) @map("unit_cost")
+
+  transfer StockTransfer  @relation(fields: [stockTransferId], references: [id], onDelete: Cascade)
+  variant  ProductVariant @relation(fields: [productVariantId], references: [id])
+
+  @@unique([stockTransferId, productVariantId])
+  @@unique([organizationId, id])
+  @@map("stock_transfer_item")
+}
+
+/// Gapless per-store document numbers (§25.6). A row-locked counter, not a
+/// sequence: a receipt number with gaps is a question from a tax inspector.
+model DocumentCounter {
+  organizationId String @map("organization_id") @db.Uuid
+  storeId        String @map("store_id") @db.Uuid
+  documentType   String @map("document_type")
+  periodKey      String @map("period_key")
+  nextValue      BigInt @default(1) @map("next_value")
+
+  @@id([organizationId, storeId, documentType, periodKey])
+  @@map("document_counter")
 }
