@@ -15,20 +15,11 @@ import {
 import { requireTenant } from '../common/tenant/tenant-context';
 import type { TenantContext } from '../common/tenant/tenant-context';
 import { PrismaService } from '../database/prisma.service';
+import type { Tx } from '../database/prisma.service';
 import { writeStockMovement } from './stock-writer';
 import type { AdjustStockDto, ListMovementsDto, ListStockDto } from './dto/inventory.dto';
 
-/**
- * The transaction client every write path receives.
- *
- * Spelled out rather than imported from Prisma's internals: it is exactly
- * `ITXClientDenyList` applied to our extended client, and writing it here
- * costs one line and survives a Prisma upgrade moving that type around.
- */
-export type Tx = Omit<
-  PrismaService['db'],
-  '$connect' | '$disconnect' | '$on' | '$transaction' | '$use' | '$extends'
->;
+export type { Tx } from '../database/prisma.service';
 
 /**
  * A single stock change. Signed: `delta` carries the direction, and the

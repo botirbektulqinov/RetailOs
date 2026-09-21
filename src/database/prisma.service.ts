@@ -10,6 +10,19 @@ import { AppConfig } from '../config/config.module';
 export type ScopedPrismaClient = ReturnType<PrismaClient['$extends']> extends infer T ? T : never;
 
 /**
+ * The transaction client every write path receives.
+ *
+ * Spelled out rather than imported from Prisma's internals: it is exactly
+ * `ITXClientDenyList` applied to our extended client. `Prisma.TransactionClient`
+ * is the UNextended type and an extended client is not assignable to it, which
+ * is the error anyone typing a `tx` parameter hits first.
+ */
+export type Tx = Omit<
+  PrismaService['db'],
+  '$connect' | '$disconnect' | '$on' | '$transaction' | '$use' | '$extends'
+>;
+
+/**
  * The single PrismaClient for the process.
  *
  * Prisma 7 requires a driver adapter — the connection URL no longer lives in

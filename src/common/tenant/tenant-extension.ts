@@ -38,6 +38,13 @@ const TENANT_MODELS = new Set<string>([
   'StockTransfer',
   'StockTransferItem',
   'DocumentCounter',
+  'Customer',
+  'Sale',
+  'SaleItem',
+  'Payment',
+  'PaymentAllocation',
+  'CustomerReceivable',
+  'IdempotencyRecord',
 ]);
 
 /** Operations whose `where` must be narrowed to the tenant. */
@@ -85,15 +92,23 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
 }
 
 /**
- * True when `where` already pins the tenant — either directly or through the
- * compound unique. A caller that has scoped correctly is left alone.
+ * True when `where` already pins the tenant — directly, or through any
+ * compound unique that includes `organizationId`.
+ *
+ * Deliberately generic rather than looking for `organizationId_id` by name:
+ * models also carry compounds like `organizationId_key` and
+ * `organizationId_storeId_saleNumber`, and a check that only knew one of them
+ * would refuse a correctly-scoped query. What matters is that the selector
+ * names this organization, not which selector it is.
  */
 function isTenantScoped(where: unknown, organizationId: string): boolean {
   if (!isPlainObject(where)) return false;
   if (where['organizationId'] === organizationId) return true;
 
-  const compound = where['organizationId_id'];
-  return isPlainObject(compound) && compound['organizationId'] === organizationId;
+  for (const value of Object.values(where)) {
+    if (isPlainObject(value) && value['organizationId'] === organizationId) return true;
+  }
+  return false;
 }
 
 interface OperationParams {

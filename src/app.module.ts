@@ -18,6 +18,7 @@ import { HealthModule } from './health/health.module';
 import { InventoryModule } from './inventory/inventory.module';
 import { OrganizationsModule } from './organizations/organizations.module';
 import { RbacModule } from './rbac/rbac.module';
+import { SalesModule } from './sales/sales.module';
 import { StoresModule } from './stores/stores.module';
 
 @Module({
@@ -58,6 +59,7 @@ import { StoresModule } from './stores/stores.module';
     EmployeesModule,
     CatalogModule,
     InventoryModule,
+    SalesModule,
     HealthModule,
   ],
   providers: [
