@@ -7,6 +7,7 @@ import { PrismaPg } from '@prisma/adapter-pg';
 import { PrismaClient } from '@prisma/client';
 import { Pool } from 'pg';
 
+import { writeStockMovement } from '../src/inventory/stock-writer';
 import { SYSTEM_ROLES } from '../src/rbac/system-roles';
 
 /**
@@ -410,6 +411,87 @@ async function seedCatalog(client: PrismaClient): Promise<string> {
   });
 }
 
+/**
+ * Opening stock for the demo catalogue.
+ *
+ * Written as INITIAL movements through the same writer the API uses, not by
+ * setting a quantity: a level that no movement explains is exactly the
+ * inconsistency §9.7's reconciliation query is there to find, and a seed is
+ * not a good place to be the first exception.
+ *
+ * Idempotent by ledger, not by level: a variant that already has any movement
+ * is skipped, so a second run neither doubles the stock nor resets a quantity
+ * someone has since adjusted.
+ */
+async function seedStock(client: PrismaClient): Promise<string> {
+  const organization = await client.organization.findUnique({
+    where: { slug: DEMO.organization.slug },
+    select: { id: true },
+  });
+  if (!organization) return 'skipped (no demo organization)';
+  const organizationId = organization.id;
+
+  const warehouse = await client.warehouse.findFirst({
+    where: { organizationId, isDefault: true, archivedAt: null },
+    select: { id: true },
+  });
+  if (!warehouse) return 'skipped (no default warehouse)';
+
+  const variants = await client.productVariant.findMany({
+    where: { organizationId, archivedAt: null },
+    select: { id: true, sku: true, purchasePrice: true, minStock: true },
+    orderBy: { sku: 'asc' },
+  });
+
+  const alreadyStocked = new Set(
+    (
+      await client.inventoryMovement.findMany({
+        where: { organizationId, warehouseId: warehouse.id },
+        select: { productVariantId: true },
+        distinct: ['productVariantId'],
+      })
+    ).map((m) => m.productVariantId),
+  );
+
+  // A spread of quantities so the stock screen has something to show: every
+  // fourth variant lands at or below its minimum, and every seventh is left
+  // out of stock entirely. The quantity is decided from the variant's
+  // position in the full catalogue, so it does not shift when a later run
+  // considers a smaller set.
+  const pending = variants
+    .map((variant, index) => {
+      const min = Number(variant.minStock.toString());
+      const quantity = index % 7 === 6 ? 0 : index % 4 === 3 ? Math.max(min, 1) : 24 + index * 6;
+      return { variant, quantity };
+    })
+    // A variant left at zero gets no movement, so it stays "not yet stocked"
+    // forever — which is correct, and is why the count below is of rows
+    // actually written rather than of rows considered.
+    .filter(({ variant, quantity }) => quantity > 0 && !alreadyStocked.has(variant.id));
+
+  if (pending.length === 0) return `0 new opening balance(s) (${alreadyStocked.size} stocked)`;
+
+  await client.$transaction(async (tx) => {
+    for (const { variant, quantity } of pending) {
+      await writeStockMovement(tx, {
+        organizationId,
+        warehouseId: warehouse.id,
+        productVariantId: variant.id,
+        type: 'INITIAL',
+        delta: quantity.toFixed(3),
+        unitCost: variant.purchasePrice,
+        sourceType: 'onboarding',
+        sourceId: null,
+        reason: null,
+        note: "Boshlang'ich qoldiq",
+        createdBy: null,
+      });
+    }
+  });
+
+  return `${pending.length} new opening balance(s)`;
+}
+
 interface SeedStep {
   name: string;
   /** true when the step may run against a production database. */
@@ -421,6 +503,7 @@ const steps: SeedStep[] = [
   { name: 'verify-schema', productionSafe: true, run: verifySchema },
   { name: 'demo-data', productionSafe: false, run: seedDemo },
   { name: 'demo-catalog', productionSafe: false, run: seedCatalog },
+  { name: 'demo-stock', productionSafe: false, run: seedStock },
 ];
 
 async function main(): Promise<void> {

@@ -23,6 +23,8 @@ export interface SeededOrg {
   storeId: string;
   secondStoreId: string;
   warehouseId: string;
+  /** A second warehouse in the same store, so a transfer has somewhere to go. */
+  secondWarehouseId: string;
   roles: Map<string, string>;
   users: Map<string, SeededUser>;
   /** Unique per call, so two orgs never collide on the global phone index. */
@@ -109,6 +111,21 @@ export async function seedTestOrg(db: PrismaClient, label: string): Promise<Seed
     select: { id: true },
   });
 
+  // Transfers need two warehouses in one organization. Both hang off the
+  // first store, so a transfer is testable without also crossing stores —
+  // those are separate concerns and a test that mixes them cannot say which
+  // rule it proved.
+  const secondWarehouse = await db.warehouse.create({
+    data: {
+      organizationId: organization.id,
+      storeId: store.id,
+      code: `${label.toUpperCase()}-1-BACK`,
+      name: 'Zaxira ombor',
+      isDefault: false,
+    },
+    select: { id: true },
+  });
+
   const users = new Map<string, SeededUser>();
   let index = 0;
   for (const role of SYSTEM_ROLES) {
@@ -144,6 +161,7 @@ export async function seedTestOrg(db: PrismaClient, label: string): Promise<Seed
     storeId: store.id,
     secondStoreId: secondStore.id,
     warehouseId: warehouse.id,
+    secondWarehouseId: secondWarehouse.id,
     roles,
     users,
     phonePrefix: prefix,
@@ -179,6 +197,25 @@ export async function dropTestOrg(db: PrismaClient, organizationId: string): Pro
   } finally {
     await db.$executeRaw`ALTER TABLE audit_log ENABLE TRIGGER tg_audit_log_immutable`;
   }
+
+  // Inventory before catalog: levels and movements reference variants and
+  // warehouses with ON DELETE RESTRICT. inventory_movement is append-only for
+  // the application, so its trigger comes off for exactly one statement — a
+  // scalpel, and only ever in a test database.
+  await db.stockTransferItem.deleteMany({ where: { organizationId } });
+  await db.stockTransfer.deleteMany({ where: { organizationId } });
+  await db.inventoryCountItem.deleteMany({ where: { organizationId } });
+  await db.inventoryCount.deleteMany({ where: { organizationId } });
+  await db.inventoryLevel.deleteMany({ where: { organizationId } });
+
+  await db.$executeRaw`ALTER TABLE inventory_movement DISABLE TRIGGER tg_inventory_movement_immutable`;
+  try {
+    await db.$executeRaw`DELETE FROM inventory_movement WHERE organization_id = ${organizationId}::uuid`;
+  } finally {
+    await db.$executeRaw`ALTER TABLE inventory_movement ENABLE TRIGGER tg_inventory_movement_immutable`;
+  }
+
+  await db.documentCounter.deleteMany({ where: { organizationId } });
 
   // Catalog before identity: variants reference products, products reference
   // categories, and every one of those foreign keys is ON DELETE RESTRICT.
