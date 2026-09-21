@@ -235,11 +235,14 @@ src/
   inventory/               levels, the movement ledger, counts, transfers
     stock-writer.ts        the two statements that move stock — the only copy
     inventory.service.ts   apply(): the single write path every caller uses
+  sales/                   checkout, sale history, receipts, cancellation
+    pricing.ts             the §10.3 calculation pipeline, pure and testable
   audit/                   the append-only audit trail
   common/
     money/                 Money primitives: bigint minor units (§8)
     quantity.ts            NUMERIC(14,3) primitives and the low-stock rule
     document-number.ts     gapless per-store document numbers (§25.6)
+    idempotency/           the record that commits with the work it guards (§26)
     tenant/                AsyncLocalStorage context + the Prisma isolation extension
     dto/                   ListQueryDto, PagedResult (§27)
     exceptions/            BusinessRuleException + the error-code catalogue (§23)
@@ -253,7 +256,7 @@ prisma/
   seed.ts
 test/
   setup-e2e.ts             raises the auth throttle before anything imports
-  foundation.e2e-spec.ts   auth.e2e-spec.ts   catalog.e2e-spec.ts   inventory.e2e-spec.ts
+  foundation · auth · catalog · inventory · sales  .e2e-spec.ts
   helpers/seed-org.ts      two complete look-alike organizations, for isolation probes
 docs/
   ARCHITECTURE.md          the source of truth
@@ -895,6 +898,219 @@ curl -s -X POST "$API/inventory-counts/$C/finalize" -H "Authorization: Bearer $T
 
 ---
 
+## Sales and checkout
+
+One rule shapes this whole module: **the server recalculates every financial
+figure.** The request says what the customer wants and how they paid. It never
+says what anything costs.
+
+A client-supplied `totalAmount` is not compared against the server's and
+rejected — it is not a field at all, so `forbidNonWhitelisted` returns 400 and
+the request never reaches the pricing code. A field nobody reads cannot be
+tampered with.
+
+### The calculation pipeline
+
+Executed in exactly this order (*§10.3*), as pure functions in
+[pricing.ts](src/sales/pricing.ts) so it can be tested without a database, a
+request or a clock:
+
+```
+ 1  gross        = roundHalfUp(unit_price × quantity)     per line
+ 2  line_discount = min(requested, gross)                 never negative
+ 3  subtotal      = Σ (gross − line_discount)
+ 4  order_discount = min(requested, subtotal)
+ 5  allocate(order_discount, weights = each line's value AFTER its own discount)
+ 6  net_amount   = gross − line_discount − allocated_order_discount
+ 7  tax          = 0                                      reserved
+ 8  rounding     = cash rounding, only if the tender is entirely cash
+ 9  total        = subtotal − order_discount + tax + rounding
+10  Σ payments + credit must equal total, EXACTLY, or 422
+```
+
+Step 5's weights matter: allocating the order discount over *gross* would
+over-discount the lines that already had one. `allocate()` distributes the
+remainder deterministically so the parts sum to exactly the whole (*§8.4*) —
+splitting 1,000 three ways by rounding each share independently gives 999 and a
+receipt that is one soʻm out.
+
+> **A note on `subtotal_amount`.** §10.3 step 7 says "subtotal ← Σ net_amount",
+> while §5.5's CHECK says "total = subtotal − order_discount + tax + rounding".
+> Those are only compatible under one reading: `subtotal_amount` is the
+> **pre-order-discount** figure. That is what is stored, it is the number a
+> receipt prints above the discount line, and both identities then hold:
+> `total = subtotal − order_discount + …` and `Σ net_amount = subtotal −
+> order_discount`. A unit test asserts both.
+
+Step 10 is `=`, not `>=`. An over-tender is change the client computes from
+`tendered − total`; the drawer never sees it, and storing tendered-and-change
+would double-count (*§11.4*).
+
+### The checkout transaction
+
+```
+BEGIN
+  ├─ idempotency record        INSERT … ON CONFLICT → replay
+  ├─ sale_number               DocumentCounter UPDATE … RETURNING
+  ├─ INSERT sale + sale_item[]
+  ├─ inventory.apply(SALE, −qty)  per line, sorted by variant  → may 409
+  ├─ INSERT payment[] + payment_allocation[]
+  └─ INSERT customer_receivable   if credit > 0
+COMMIT
+  → audit
+```
+
+All of it, or none of it. There is no window in which the stock has moved but
+the money has not been recorded, because there is no second transaction.
+
+Stock is deducted through `InventoryService.apply()`, the same write path
+everything else uses, so a sale is an ordinary entry in the ledger rather than
+a special case — and the reconciliation query in *§9.7* still returns nothing
+after a day's trading.
+
+### Prices and permissions
+
+| What the client may send | What the server does |
+|---|---|
+| `variantId`, `quantity` | trusted — this is the order |
+| `unitPrice` | **403** unless `sales.override_price`; otherwise catalogue price |
+| `discountAmount` (line) | **403** unless `sales.discount_item` |
+| `orderDiscountAmount` | **403** unless `sales.discount_order` |
+| `creditAmount` | **403** unless `debt.create`; requires a customer |
+| anything else financial | **400** — the field does not exist |
+
+`unit_cost` is snapshotted from `inventory_level.avg_cost` at the moment of
+sale, and `name_snapshot` / `sku_snapshot` freeze what the receipt said. Rename
+a product tomorrow and last month's receipt is unchanged; margin is a
+subtraction on stored values rather than a lookup of a price that has since
+moved.
+
+### Mixed payment
+
+```
+Payment                    — money moved: how much, which method
+  └─ PaymentAllocation[]   — what that money settled (a sale, or a debt)
+```
+
+The architecture's worked example, and a test:
+
+| | |
+|---|---|
+| Sale total | 450,000 |
+| `payment` CASH | 200,000 → `allocation` → sale |
+| `payment` CARD | 150,000 → `allocation` → sale |
+| `customer_receivable` | 100,000, `OPEN` |
+
+`paid_amount + credit_amount = total_amount` is a **database CHECK**, not a
+convention. So is `total = subtotal − order_discount + tax + rounding`, and so
+is `net_amount = gross − line_discount − allocated_order_discount` per line. A
+sale whose own figures disagree cannot be persisted, whatever a future code
+path does.
+
+A debt payment in Sprint 6 uses the same two tables. No debt-specific payment
+table, and no second copy of the cash-drawer logic.
+
+`payment_allocation` is append-only, enforced by trigger — an allocation that
+can be edited is a payment history that can be rewritten.
+
+### Idempotency
+
+`Idempotency-Key: <uuid v4>` is **required** on checkout; missing → 400. Not
+optional-with-a-fallback: a server-generated key makes every request unique,
+which is exactly the property idempotency exists to remove.
+
+```
+INSERT idempotency_record (IN_PROGRESS)  ── in the same transaction as the sale
+   conflict? ─ hash differs      → 409 IDEMPOTENCY_KEY_REUSED
+             ─ still IN_PROGRESS → 409 REQUEST_IN_PROGRESS
+             ─ COMPLETED         → replay the stored response
+```
+
+The record commits **with the sale**, so "the sale committed but the record did
+not" is not a reachable state. It is implemented as a service the handler calls
+rather than the interceptor the architecture sketched, because an interceptor
+sits outside the handler's transaction and could not make that guarantee.
+
+Rollback gives §26.2's "failure → delete the record" for free: a checkout that
+fails on stock takes its `IN_PROGRESS` row with it, and the same key can be
+retried. A test asserts exactly that.
+
+**Second layer.** Keys are client cooperation, and a client that regenerates
+one defeats them. So the money paths carry natural keys too, as database
+constraints: `sale.client_id` and `payment.client_id` are unique per
+organization, and `customer_receivable.sale_id` is unique, so one sale can
+never spawn two debts.
+
+### Cancellation
+
+A completed sale is never deleted and its figures are never rewritten.
+
+```
+status → CANCELLED (+ reason, mandatory)
+stock  → a compensating RETURN movement
+money  → an opposite-direction payment, allocated to the same sale
+debt   → written off, never deleted
+```
+
+The claim is a conditional `UPDATE … WHERE status = 'COMPLETED'`, the same
+shape as the stock guard, so two cancellations of one sale cannot both restore
+the stock. A sale that has already been returned against is refused: two
+mechanisms undoing the same money is how a refund gets paid twice.
+
+### What is deliberately not here
+
+- **Cash register shifts.** `sale.cash_register_shift_id` is in the
+  architecture and is not in this schema. Shifts are their own sprint, and a
+  nullable UUID column with no table behind it is a lie in the schema; adding
+  the column later is a one-line migration.
+- **Customer CRUD.** Sprint 5 creates the `customer` table and the foreign key
+  because a credit sale needs somebody to owe the money. The screens are
+  Sprint 6's, which owns that domain.
+- **Drafts / held carts.** `SaleStatus.DRAFT` exists in the enum; nothing
+  writes it. The fast path is a single `POST /sales/checkout`, and a parked
+  cart is a screen nobody has asked for yet.
+- **Promotions and loyalty.** `LOYALTY` tender is rejected with a 422 naming
+  the sprint that will support it, rather than accepted and silently ignored.
+
+### Endpoints
+
+| Method | Path | Permission |
+|---|---|---|
+| `POST` | `/sales/checkout` | `sales.create` + `Idempotency-Key` |
+| `GET` | `/sales` | `sales.read` |
+| `GET` | `/sales/:id` | `sales.read` |
+| `GET` | `/sales/:id/receipt` | `sales.read` |
+| `POST` | `/sales/:id/cancel` | `sales.cancel` |
+
+POS product lookup is already the catalog's: `GET /products/lookup?barcode=…`
+is a single index hit, and `GET /products?q=…` searches name, SKU and barcode.
+No second search endpoint.
+
+```bash
+# A cash sale
+curl -s -X POST "$API/sales/checkout" -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' -H "Idempotency-Key: $(uuidgen)" \
+  -d '{"items":[{"variantId":"'$V'","quantity":"3.000"}],
+       "payments":[{"method":"CASH","amount":72000}]}'
+
+# Mixed: cash + card + credit
+curl -s -X POST "$API/sales/checkout" -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' -H "Idempotency-Key: $(uuidgen)" \
+  -d '{"items":[{"variantId":"'$V'","quantity":"10.000"}],
+       "payments":[{"method":"CASH","amount":200000},
+                   {"method":"CARD","amount":150000}],
+       "creditAmount":100000,"customerId":"'$C'"}'
+
+# The day's takings
+curl -s "$API/sales?dateFrom=2026-09-21T00:00:00Z&limit=50" \
+  -H "Authorization: Bearer $TOKEN"
+
+# Receipt, built entirely from stored values
+curl -s "$API/sales/$SALE/receipt" -H "Authorization: Bearer $TOKEN"
+```
+
+---
+
 ## Foundation behaviour worth knowing
 
 **API versioning.** URI-based: every route lives under `/api/v1/...`. The
@@ -936,6 +1152,11 @@ exponent 0, so `450000` means 450,000 so'm. Money is serialized as a JSON
 integer. There is no `Money` class — a `bigint` *is* the type, so
 `price * 1.2` is a `TypeError` rather than a silent float (*§8*).
 
+**Idempotency.** `Idempotency-Key: <uuid v4>` is required on any endpoint that
+moves money or stock and could plausibly be submitted twice. The record is
+written in the same transaction as the work, so a replay is exact and a failure
+frees the key (*§26*).
+
 **Quantities.** A decimal string with three decimal places (`"1.500"`), in
 requests as well as responses. Stock is `NUMERIC(14,3)` — 1.5 kg of rice is a
 real quantity — and a string keeps the parsing decision in the one place that
@@ -958,7 +1179,7 @@ Sprint 1 is the foundation. Phases follow *§33 Implementation order*:
 | **2 ✅** | Tenancy & auth: Organization, Store, Warehouse, User, Role, StoreMembership, JWT + refresh rotation, guard chain, Prisma tenant extension, audit service | the tenant-isolation suite passes |
 | **3 ✅** | Catalog: Category, Product, ProductVariant, barcode lookup, search | the catalog suite passes |
 | **4 ✅** | Inventory: levels, the movement ledger, the single `apply()` write path, warehouses, counts, transfers | the projection equals the ledger under parallel load |
-| 5 | Sales / POS: pricing pipeline, checkout transaction, payments, idempotency |
+| **5 ✅** | Sales / POS: pricing pipeline, checkout transaction, mixed payments, idempotency, cancellation | a sale's own figures cannot disagree — the database checks them |
 | 6 | Customers & debt: receivables, debt payments, balances |
 | 7 | Procurement: suppliers, purchases, receiving, payables |
 | 8+ | Returns & exchanges, discounts & loyalty, cash register, reporting |
