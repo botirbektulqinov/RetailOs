@@ -237,6 +237,7 @@ src/
     inventory.service.ts   apply(): the single write path every caller uses
   sales/                   checkout, sale history, receipts, cancellation
     pricing.ts             the §10.3 calculation pipeline, pure and testable
+  customers/               customers, groups, notes and the debt ledger
   audit/                   the append-only audit trail
   common/
     money/                 Money primitives: bigint minor units (§8)
@@ -256,7 +257,7 @@ prisma/
   seed.ts
 test/
   setup-e2e.ts             raises the auth throttle before anything imports
-  foundation · auth · catalog · inventory · sales  .e2e-spec.ts
+  foundation · auth · catalog · inventory · sales · customers  .e2e-spec.ts
   helpers/seed-org.ts      two complete look-alike organizations, for isolation probes
 docs/
   ARCHITECTURE.md          the source of truth
@@ -1111,6 +1112,165 @@ curl -s "$API/sales/$SALE/receipt" -H "Authorization: Bearer $TOKEN"
 
 ---
 
+## Customers and debt
+
+**No debt may disappear, and no payment may disappear.** Everything below
+follows from that.
+
+There is no `customer.debt` column and there never will be. A customer's
+balance is `SUM(original − paid − written_off)` over their open receivables,
+computed every time it is asked for. A mutable balance is a number that drifts
+from the documents it summarises, and the transaction that forgets to update it
+is the one nobody notices.
+
+If that aggregate ever becomes slow it becomes a materialized view, not a
+column.
+
+### The receivable
+
+One document per debt, never a running total:
+
+| Column | |
+|---|---|
+| `original_amount` | what was owed. Never rewritten. |
+| `paid_amount` | sum of this debt's payment allocations |
+| `written_off_amount` | a loss. Never netted into `paid_amount`. |
+| `status` | `OPEN` → `PARTIALLY_PAID` → `PAID` / `WRITTEN_OFF` |
+
+`remaining_amount` is deliberately **not** a column. The architecture proposed
+a `GENERATED ALWAYS … STORED` column because it could not then drift from its
+inputs; not storing it at all achieves the same thing more simply, and
+`CHECK (paid + written_off <= original)` makes over-payment impossible at the
+database level rather than merely unlikely.
+
+A sale's debt is born inside the checkout transaction, where it commits with
+the sale that caused it. `customer_receivable.sale_id` is UNIQUE, so one sale
+can never spawn two debts — whatever a retrying client does.
+
+### `OVERDUE` is not a status
+
+It is `remaining > 0 AND due_date < CURRENT_DATE`, evaluated in the query.
+
+Making it a status would need a nightly job to flip rows, and every row would
+be lying from midnight until that job ran. The filters the UI needs are all
+predicates, and all served by one partial index:
+
+| `?filter=` | Predicate |
+|---|---|
+| `overdue` | open **and** `due_date < today` |
+| `due_today` | open **and** `due_date = today` |
+| `due_soon` | open **and** due within 7 days |
+| `unpaid` / `partially_paid` / `paid` / `written_off` | the stored status |
+
+The customer list applies the same predicates as aggregates, so `?overdue=true`
+and `?sort=debt:desc` are one query rather than a page of customers plus a debt
+query per row.
+
+### Collecting
+
+```
+Payment (IN, 100,000, CASH)
+  └─ PaymentAllocation → receivable   (one per debt it settled)
+```
+
+The same two tables a sale payment uses. No debt-specific payment table, and no
+second copy of the cash-drawer logic.
+
+Unspecified targets are paid **oldest due first** — what a shopkeeper does by
+hand, and the ordering that minimises how long anything stays overdue. Explicit
+`receivableIds` override it.
+
+Each allocation is applied with a conditional `UPDATE`:
+
+```sql
+UPDATE customer_receivable
+   SET paid_amount = paid_amount + $part, status = CASE … END
+ WHERE id = $id
+   AND paid_amount + written_off_amount + $part <= original_amount;
+```
+
+Two cashiers collecting against the same debt at the same moment cannot
+together push it past `original_amount`: one matches zero rows and gets a 409.
+The same shape as the stock guard, for the same reason.
+
+**Over-payment is rejected, not absorbed** (*§12.5*). A payment larger than the
+outstanding debt returns `409 RECEIVABLE_OVERPAYMENT` with the excess in the
+payload, and **nothing is written** — not even the part that would have fitted.
+Store credit is the other reasonable answer and needs a credit balance, a
+redemption tender and an expiry policy, none of which the design has.
+
+Debt payments are idempotent: `Idempotency-Key` is required, and the record
+commits with the payment.
+
+### Write-off
+
+`POST /debts/:id/write-off` requires `debt.write_off` and a reason — mandatory
+in the DTO *and* in the database.
+
+A write-off is **never** added to `paid_amount`. A write-off is a loss and a
+collection is revenue; a report that conflates them is a report that hides the
+losses. Both are kept, and the balance endpoint returns `lifetimePaid` and
+`lifetimeWrittenOff` separately.
+
+### Groups and notes
+
+A customer belongs to at most one **group** (VIP, Ulgurji, Doimiy), which
+carries a discount percentage — read by Sprint 9 — and a credit limit. Credit
+resolves customer → group → unlimited, and the customer card states which one
+applied, because a cashier refused at the counter needs to know what stopped
+them.
+
+Groups rather than free-form tags: the design shows one badge per customer, and
+a group carries numbers a tag could not. A many-to-many tag table would serve a
+screen that does not exist.
+
+**Notes are an append-only log**, enforced by trigger. "Called, promised
+Friday" is worth having precisely when the promise is not kept, and a single
+editable text field would let it be rewritten by the person who broke it.
+
+### Archiving
+
+A customer is archived, never deleted — their sales and receivables name them
+forever. **A customer who still owes money cannot be archived**: hiding a
+debtor is how a debt stops being collected without anybody deciding to stop
+collecting it.
+
+### Endpoints
+
+| Method | Path | Permission |
+|---|---|---|
+| `GET` `POST` | `/customers` | `customers.read` / `customers.create` |
+| `GET` `PATCH` | `/customers/:id` | `customers.read` / `customers.update` |
+| `GET` | `/customers/:id/balance` `…/debts` `…/payments` | `debt.read` |
+| `GET` | `/customers/:id/sales` | `customers.read` |
+| `POST` | `/customers/:id/notes` | `customers.update` |
+| `PATCH` | `/customers/:id/archive` `…/restore` | `customers.delete` / `.update` |
+| `GET` `POST` `PATCH` | `/customer-groups` | `customers.read` / `customers.update` |
+| `GET` | `/debts`, `/debts/:id` | `debt.read` |
+| `POST` | `/debts` | `debt.create` |
+| `POST` | `/debts/payments` | `debt.pay` + `Idempotency-Key` |
+| `POST` | `/debts/:id/write-off` | `debt.write_off` |
+
+```bash
+# Who owes money, most first
+curl -s "$API/customers?hasDebt=true&sort=debt:desc" -H "Authorization: Bearer $TOKEN"
+
+# The collections list
+curl -s "$API/debts?filter=overdue&sort=dueDate:asc" -H "Authorization: Bearer $TOKEN"
+
+# Collect 100,000 - spread over the oldest debts first
+curl -s -X POST "$API/debts/payments" -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' -H "Idempotency-Key: $(uuidgen)" \
+  -d '{"customerId":"CUSTOMER_ID","amount":100000,"method":"CASH"}'
+
+# Give up on the rest, with a reason that stays in the audit log
+curl -s -X POST "$API/debts/DEBT_ID/write-off" -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"reason":"Mijoz bilan kelishildi"}'
+```
+
+---
+
 ## Foundation behaviour worth knowing
 
 **API versioning.** URI-based: every route lives under `/api/v1/...`. The
@@ -1180,7 +1340,7 @@ Sprint 1 is the foundation. Phases follow *§33 Implementation order*:
 | **3 ✅** | Catalog: Category, Product, ProductVariant, barcode lookup, search | the catalog suite passes |
 | **4 ✅** | Inventory: levels, the movement ledger, the single `apply()` write path, warehouses, counts, transfers | the projection equals the ledger under parallel load |
 | **5 ✅** | Sales / POS: pricing pipeline, checkout transaction, mixed payments, idempotency, cancellation | a sale's own figures cannot disagree — the database checks them |
-| 6 | Customers & debt: receivables, debt payments, balances |
+| **6 ✅** | Customers & debt: groups, notes, receivables, FIFO collection, write-off | no debt and no payment can disappear; over-payment is refused |
 | 7 | Procurement: suppliers, purchases, receiving, payables |
 | 8+ | Returns & exchanges, discounts & loyalty, cash register, reporting |
 

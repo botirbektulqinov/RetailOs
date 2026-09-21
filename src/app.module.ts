@@ -13,6 +13,7 @@ import { AllExceptionsFilter } from './common/filters/all-exceptions.filter';
 import { buildLoggerOptions } from './common/logging/logger.options';
 import { AppConfig, ConfigModule } from './config/config.module';
 import { DatabaseModule } from './database/prisma.module';
+import { CustomersModule } from './customers/customers.module';
 import { EmployeesModule } from './employees/employees.module';
 import { HealthModule } from './health/health.module';
 import { InventoryModule } from './inventory/inventory.module';
@@ -60,6 +61,7 @@ import { StoresModule } from './stores/stores.module';
     CatalogModule,
     InventoryModule,
     SalesModule,
+    CustomersModule,
     HealthModule,
   ],
   providers: [

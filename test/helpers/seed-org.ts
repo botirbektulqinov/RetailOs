@@ -211,7 +211,14 @@ export async function dropTestOrg(db: PrismaClient, organizationId: string): Pro
   await db.payment.deleteMany({ where: { organizationId } });
   await db.saleItem.deleteMany({ where: { organizationId } });
   await db.sale.deleteMany({ where: { organizationId } });
+  await db.$executeRaw`ALTER TABLE customer_note DISABLE TRIGGER tg_customer_note_immutable`;
+  try {
+    await db.customerNote.deleteMany({ where: { organizationId } });
+  } finally {
+    await db.$executeRaw`ALTER TABLE customer_note ENABLE TRIGGER tg_customer_note_immutable`;
+  }
   await db.customer.deleteMany({ where: { organizationId } });
+  await db.customerGroup.deleteMany({ where: { organizationId } });
   await db.idempotencyRecord.deleteMany({ where: { organizationId } });
 
   // Inventory before catalog: levels and movements reference variants and

@@ -850,21 +850,25 @@ enum IdempotencyStatus {
   COMPLETED
 }
 
-/// Minimal now — Sprint 6 adds groups, credit limits and the CRM screens.
-/// Introduced here because a credit sale needs somebody to owe the money, and
-/// a `customer_id` with no table behind it is a foreign key waiting to be
-/// wrong.
+/// Introduced in Sprint 5 because a credit sale needs somebody to owe the
+/// money; Sprint 6 added groups, the birth date and the CRM screens.
+///
+/// There is deliberately no `debt` or `balance` column. A customer's debt is
+/// SUM(remaining) over their open receivables, and a mutable balance is a
+/// number that drifts from the documents it is supposed to summarise — which
+/// is the one thing a debt module must never do.
 model Customer {
-  id             String @id @default(uuid()) @db.Uuid
-  organizationId String @map("organization_id") @db.Uuid
+  id              String  @id @default(uuid()) @db.Uuid
+  organizationId  String  @map("organization_id") @db.Uuid
+  customerGroupId String? @map("customer_group_id") @db.Uuid
 
-  fullName String  @map("full_name")
-  phone    String?
-  email    String? @db.Citext
-  address  String?
-  notes    String?
+  fullName  String    @map("full_name")
+  birthDate DateTime? @map("birth_date") @db.Date
+  phone     String?
+  email     String?   @db.Citext
+  address   String?
 
-  /// null = no customer-specific limit. Sprint 6 adds the group fallback.
+  /// null = fall back to the group's limit; null there too = unlimited.
   creditLimit BigInt? @map("credit_limit")
 
   status     EntityStatus @default(ACTIVE)
@@ -874,14 +878,68 @@ model Customer {
   createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
   updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
 
+  group       CustomerGroup?       @relation(fields: [customerGroupId], references: [id])
   sales       Sale[]
   payments    Payment[]
   receivables CustomerReceivable[]
+  notes       CustomerNote[]
 
   @@unique([organizationId, id])
   @@index([organizationId, fullName])
   @@index([organizationId, phone])
+  @@index([organizationId, customerGroupId])
   @@map("customer")
+}
+
+/// VIP, Ulgurji, Doimiy — the shop's own segmentation.
+///
+/// A group, not free-form tags: the design's customer screen shows one badge
+/// per customer, and a group carries a discount and a credit limit that a tag
+/// could not. Many-to-many tags would be a join table serving a screen that
+/// does not exist.
+model CustomerGroup {
+  id             String @id @default(uuid()) @db.Uuid
+  organizationId String @map("organization_id") @db.Uuid
+
+  name        String
+  description String?
+
+  /// Applied at checkout from Sprint 9; stored now so a group created today
+  /// already carries the number that sprint will read.
+  discountPercent Decimal @default(0) @map("discount_percent") @db.Decimal(5, 2)
+
+  /// The fallback when the customer has none of their own.
+  creditLimit BigInt? @map("credit_limit")
+
+  archivedAt DateTime? @map("archived_at") @db.Timestamptz(6)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  customers Customer[]
+
+  @@unique([organizationId, id])
+  @@map("customer_group")
+}
+
+/// Dated, attributed notes rather than one overwritable text field: "called,
+/// promised Friday" is a log, and the previous entry is the part that matters
+/// when the promise is not kept.
+model CustomerNote {
+  id             String @id @default(uuid()) @db.Uuid
+  organizationId String @map("organization_id") @db.Uuid
+  customerId     String @map("customer_id") @db.Uuid
+
+  body String
+
+  createdBy String   @map("created_by") @db.Uuid
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  customer Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+
+  @@unique([organizationId, id])
+  @@index([organizationId, customerId, createdAt(sort: Desc)])
+  @@map("customer_note")
 }
 
 /// A completed sale is a historical document. Every figure on it is stored,

@@ -45,6 +45,8 @@ const TENANT_MODELS = new Set<string>([
   'PaymentAllocation',
   'CustomerReceivable',
   'IdempotencyRecord',
+  'CustomerGroup',
+  'CustomerNote',
 ]);
 
 /** Operations whose `where` must be narrowed to the tenant. */

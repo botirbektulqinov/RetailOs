@@ -1,14 +1,4 @@
-import {
-  BadRequestException,
-  Body,
-  Controller,
-  Get,
-  Headers,
-  Param,
-  ParseUUIDPipe,
-  Post,
-  Query,
-} from '@nestjs/common';
+import { Body, Controller, Get, Headers, Param, ParseUUIDPipe, Post, Query } from '@nestjs/common';
 import {
   ApiBearerAuth,
   ApiConflictResponse,
@@ -20,13 +10,10 @@ import {
 
 import { CurrentUser } from '../auth/decorators/current-user.decorator';
 import { RequirePermissions } from '../auth/decorators/require-permissions.decorator';
-import { BusinessRuleException } from '../common/exceptions/business-rule.exception';
-import { ErrorCode } from '../common/exceptions/error-codes';
+import { requireIdempotencyKey } from '../common/idempotency/idempotency-key';
 import type { TenantContext } from '../common/tenant/tenant-context';
 import { CancelSaleDto, CheckoutDto, ListSalesDto } from './dto/sale.dto';
 import { SalesService } from './sales.service';
-
-const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-9a-f][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 @ApiTags('sales')
 @ApiBearerAuth('bearer')
@@ -115,26 +102,4 @@ export class SalesController {
   ) {
     return this.sales.cancel(id, dto, user);
   }
-}
-
-/**
- * The header is mandatory on checkout — docs/ARCHITECTURE.md §26.2.
- *
- * Required rather than optional-with-a-fallback: a server-generated key makes
- * every request unique, which is exactly the property idempotency exists to
- * remove. A client that cannot be bothered to send one gets a 400 telling it
- * why, not a silently duplicated sale.
- */
-function requireIdempotencyKey(key: string | undefined): string {
-  if (!key?.trim()) {
-    throw new BusinessRuleException({
-      code: ErrorCode.IDEMPOTENCY_KEY_REQUIRED,
-      status: 400,
-      detail: 'Idempotency-Key sarlavhasi majburiy (UUID v4).',
-    });
-  }
-  if (!UUID_V4.test(key.trim())) {
-    throw new BadRequestException("Idempotency-Key UUID v4 bo'lishi kerak.");
-  }
-  return key.trim();
 }
