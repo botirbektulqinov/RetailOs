@@ -228,28 +228,40 @@ src/
   config/                  Zod environment schema + typed AppConfig
   database/                PrismaService (owns the pg pool), global DatabaseModule
   health/                  liveness + readiness
+  auth/                    login, tokens, sessions, guards
+  rbac/                    the permission catalogue and system roles
+  organizations/ stores/ employees/
+  catalog/                 categories, products, variants
+  inventory/               levels, the movement ledger, counts, transfers
+    stock-writer.ts        the two statements that move stock — the only copy
+    inventory.service.ts   apply(): the single write path every caller uses
+  audit/                   the append-only audit trail
   common/
     money/                 Money primitives: bigint minor units (§8)
+    quantity.ts            NUMERIC(14,3) primitives and the low-stock rule
+    document-number.ts     gapless per-store document numbers (§25.6)
+    tenant/                AsyncLocalStorage context + the Prisma isolation extension
     dto/                   ListQueryDto, PagedResult (§27)
     exceptions/            BusinessRuleException + the error-code catalogue (§23)
     filters/               AllExceptionsFilter — the only place an error becomes a response
     http/                  request/correlation id
     logging/               pino options + redaction
 prisma/
-  schema.prisma            foundation only — no domain models yet
+  schema.prisma            foundation, catalog and inventory
   schema.draft.prisma      the full 40-model draft, promoted sprint by sprint
   migrations/
   seed.ts
 test/
-  foundation.e2e-spec.ts
+  setup-e2e.ts             raises the auth throttle before anything imports
+  foundation.e2e-spec.ts   auth.e2e-spec.ts   catalog.e2e-spec.ts   inventory.e2e-spec.ts
+  helpers/seed-org.ts      two complete look-alike organizations, for isolation probes
 docs/
   ARCHITECTURE.md          the source of truth
 ```
 
-Future feature modules (`auth/`, `catalog/`, `inventory/`, `sales/`, …) are
-**not** scaffolded as empty folders. They are created by the sprint that
-implements them — see *§30* for the planned layout and the module boundary
-rules.
+Remaining feature modules (`sales/`, `customers/`, `purchases/`, …) are **not**
+scaffolded as empty folders. They are created by the sprint that implements
+them — see *§30* for the planned layout and the module boundary rules.
 
 ---
 
@@ -590,6 +602,299 @@ would be four more strings that always move together with `products.*`.
 
 ---
 
+## Inventory
+
+Stock is never a column on a product. There is no `product.stock` anywhere in
+the schema, and adding one would be the fastest way to lose the ability to
+answer "why is this number 47".
+
+Two structures, one truth (*§9.1*):
+
+| | `inventory_movement` | `inventory_level` |
+|---|---|---|
+| Role | the ledger — **truth** | the projection — **speed** |
+| Mutation | insert only, trigger-enforced | `UPDATE`, in the same transaction |
+| Rebuildable | no | yes, from the ledger |
+| Read by | stock card, audit, reconciliation | POS availability, stock list, low stock |
+
+Every stock number is always `inventory_level.quantity` for a (warehouse,
+variant), and is always verifiable against `SUM(movement.quantity_delta)`. The
+suite asserts that equality directly, and so can you:
+
+```sql
+SELECT l.warehouse_id, l.product_variant_id
+  FROM inventory_level l
+  LEFT JOIN inventory_movement m
+    ON m.warehouse_id = l.warehouse_id AND m.product_variant_id = l.product_variant_id
+ GROUP BY l.warehouse_id, l.product_variant_id, l.quantity
+HAVING l.quantity <> COALESCE(SUM(m.quantity_delta), 0);
+```
+
+Any row this returns is a bug: some code path moved a level without going
+through `apply()`. In a correct system it always returns nothing, which is
+exactly why it is worth running.
+
+### The single write path
+
+Every stock change in the system — sale, purchase, return, transfer, count
+correction, manual adjustment — goes through one method:
+
+```ts
+// src/inventory/inventory.service.ts
+await inventory.apply(tx, {
+  organizationId, warehouseId, variantId,
+  type: 'SALE', delta: -2,        // signed
+  sourceType: 'sale', sourceId: saleId,
+  actorId: userId,
+});
+```
+
+`apply()` **never opens its own transaction** — it always receives one. That is
+what makes "the sale and its stock movements commit or fail together"
+structurally true rather than something each caller has to remember. The two
+statements it runs live in `src/inventory/stock-writer.ts`, so the seed can
+write opening balances through exactly the same code rather than growing a
+second, slowly diverging copy.
+
+`applyMany()` sorts its commands by (warehouse, variant) before applying them,
+so two multi-line documents touching the same products always take those row
+locks in the same order and cannot deadlock.
+
+### Why it cannot oversell
+
+The guard and the mutation are one statement (*§9.3*):
+
+```sql
+UPDATE inventory_level
+   SET quantity = quantity + $delta, ...
+ WHERE warehouse_id = $w AND product_variant_id = $v
+   AND ($allowNegative OR quantity + $delta >= 0)
+RETURNING quantity;
+```
+
+PostgreSQL takes a row lock for the duration of the `UPDATE` and re-evaluates
+the `WHERE` against the **committed** row, so two cashiers selling the last
+unit serialize automatically and exactly one wins. Zero rows affected means the
+guard refused: **409 `INSUFFICIENT_STOCK`**, with the available quantity in the
+payload.
+
+There is deliberately no `SELECT … FOR UPDATE` followed by an application-side
+check. That pattern has a window between the read and the write under `READ
+COMMITTED`, and closing it costs `REPEATABLE READ` plus a retry loop. This has
+no window and needs no retries.
+
+The same shape guards every state transition that moves stock. Finalizing a
+count and receiving a transfer are both conditional `UPDATE`s on the document's
+status, not a read-then-check — two clerks scanning the same pallet would
+otherwise both pass the check and the goods would arrive twice. The e2e suite
+fires those requests genuinely in parallel, because a check-then-act bug
+survives any sequential test.
+
+**Negative stock** resolves per warehouse: `warehouse.allow_negative_stock` →
+else `organization_settings.allow_negative_stock` → else `false`. It is read
+inside the guard itself, because a policy fetched a moment earlier is a policy
+that can be stale at the only moment it matters. The MVP default is `false`: a
+shop that cannot sell what it does not have finds its data-entry mistakes on
+day one instead of month three.
+
+### Warehouses
+
+```
+Organization
+  └── Store
+       └── Warehouse   (store_id may be NULL — a central warehouse)
+```
+
+Stock lives in a warehouse, never in a store. A store is where people are; a
+warehouse is where goods are. `store_id` is nullable so a central warehouse can
+serve several branches, and at most one warehouse per store may be the default
+(a partial unique index enforces it).
+
+A warehouse is archived, never deleted — every movement ever written names it,
+and those foreign keys are `ON DELETE RESTRICT`. Archiving one that still holds
+stock is refused: allowing it would hide that stock from every report while it
+still counted in the totals.
+
+### Movement types
+
+| Type | Sign | Written by |
+|---|---|---|
+| `INITIAL` | + | onboarding / opening balance |
+| `PURCHASE` | + | goods received (Sprint 7) |
+| `SALE` | − | checkout (Sprint 5) |
+| `RETURN` | + | a return (Sprint 8) |
+| `TRANSFER_OUT` / `TRANSFER_IN` | − / + | stock transfer |
+| `COUNT_CORRECTION` | ± | finalizing a stocktake |
+| `ADJUSTMENT` | ± | manual, reason required |
+| `DAMAGE` / `WRITE_OFF` | − | manual, reason required |
+
+The sign is enforced by a `CHECK`, not by convention: a `PURCHASE` that removes
+stock cannot be written even by hand-rolled SQL, and once written it could not
+be corrected, because the table is append-only. `ADJUSTMENT` and
+`COUNT_CORRECTION` are the only two types that may move in either direction.
+
+`ADJUSTMENT`, `DAMAGE` and `WRITE_OFF` must carry a `reason` — also a `CHECK`.
+"Where did those three go" is the question this table exists to answer.
+
+The ledger is append-only for real: a `BEFORE UPDATE OR DELETE` trigger raises,
+so a careless `updateMany` fails loudly instead of silently rewriting the
+history every stock number rests on.
+
+### Cost
+
+Moving weighted average, held in `inventory_level.avg_cost` and recomputed
+**inside the same `UPDATE` that moves the quantity** — so a quantity and the
+cost it is valued at can never disagree (*§8.6*):
+
+```
+avg_cost = round((q0 × c0 + qty × unit_cost) / (q0 + qty))
+```
+
+FIFO layers are rejected for the MVP: they need a `cost_layer` table, layer
+consumption on every sale and layer restoration on every return, for a
+difference that only shows up under volatile purchase costs.
+
+### Low stock
+
+Derived, never stored (*§7.6*). A stored status would need updating on every
+movement **and** on every edit of `minStock`, and the second one is the update
+everybody forgets.
+
+| Condition | Status |
+|---|---|
+| `quantity <= 0` | `OUT_OF_STOCK` |
+| `minStock > 0 && quantity <= minStock` | `LOW_STOCK` |
+| otherwise | `IN_STOCK` |
+
+`minStock = 0` means no minimum is configured, so such a variant is never
+`LOW_STOCK` — otherwise every product in the catalogue would be "low" the
+moment it ran out, which is what `OUT_OF_STOCK` already says.
+
+`GET /inventory` is driven from `product_variant` with a `LEFT JOIN` onto
+levels, **not** the other way round. A product that has never been stocked has
+no level row, and that is precisely the row an out-of-stock report must show; a
+levels-driven report would silently omit everything most in need of ordering.
+`?lowStock=true` is the re-order list: out of stock *or* at/below the minimum.
+
+Every filter, including `LOW_STOCK`, is evaluated in the database. That
+comparison reads two columns across a relation, which Prisma cannot express, so
+that one list is hand-written SQL — and because the tenant extension never sees
+a `$queryRaw`, it is also the one place in the codebase that names
+`organization_id` explicitly.
+
+### Inventory counts
+
+Three phases, and only the third moves stock (*§9.5*):
+
+```
+DRAFT / COUNTING   lines generated, expected_quantity snapshotted;
+                   staff enter what they found; the shop keeps selling
+      │ finalize
+      ▼
+FINALIZED          corrections applied in one transaction
+```
+
+The counting phase deliberately locks nothing. A shop cannot stop trading for
+the hours a stocktake takes.
+
+The correction is `counted − current`, **not** `counted − expected`. The
+snapshot is hours old by then, and using it would silently reverse every sale
+made while the count was open: a shop that counted 50, sold 3 and finalized
+would end up back at 50 holding three units it no longer has. Both numbers are
+kept — `expected_quantity` for the report, `applied_delta` for what actually
+moved.
+
+Lines that were never counted are **skipped, not zeroed**. Counting nothing is
+not the same as counting zero, and conflating the two destroys inventory.
+
+A partial unique index allows one open count per warehouse, which removes an
+entire class of race at the database level.
+
+### Transfers
+
+```
+SENT       TRANSFER_OUT applied at the source immediately
+  │ receive
+  ▼
+RECEIVED   TRANSFER_IN applied at the destination for what actually arrived
+```
+
+Stock leaves at send, not at receive, because the van is not a warehouse: a
+branch that can still sell goods already loaded onto a truck will oversell
+them. Goods in transit belong to neither warehouse's sellable stock.
+
+Receiving less than was sent is allowed — shrinkage in transit is real — and
+requires a note. The shortfall is **not** written off again at the source.
+
+> *§9.6 prescribes a `WRITE_OFF` at the source for the difference. Followed
+> literally that double-counts the loss: the source already gave up the full
+> quantity at send time, so a second deduction takes stock it no longer has.
+> The shortfall is instead documented on the transfer line (`quantity` versus
+> `received_quantity`, with a mandatory note) and is already visible in the
+> ledger as the gap between the two legs of the same `source_id`. The loss is
+> recorded exactly once.*
+
+Cancelling a transfer still in transit returns the goods as a `TRANSFER_IN` at
+the source rather than deleting the `TRANSFER_OUT`. The ledger is append-only,
+and "it went out and came back" is what actually happened.
+
+### Document numbers
+
+`INV-000001`, `TRF-000001`. A row-locked counter per (store, type, period), not
+a sequence: a sequence is faster and leaves gaps on rollback, and a receipt
+number with gaps is a question from a tax inspector. The ceiling is roughly
+50–100 documents/sec/store and is marked in the code with its upgrade path.
+
+### Endpoints
+
+| Method | Path | Permission |
+|---|---|---|
+| `GET` | `/inventory` | `inventory.read` |
+| `GET` | `/inventory/movements` | `inventory.read` |
+| `GET` | `/inventory/:variantId` | `inventory.read` |
+| `POST` | `/inventory/adjustments` | `inventory.adjust` |
+| `GET` | `/warehouses`, `/warehouses/:id` | `inventory.read` |
+| `POST` `PATCH` | `/warehouses`, `/warehouses/:id`, `…/archive`, `…/restore` | `stores.manage` |
+| `GET` | `/inventory-counts`, `/inventory-counts/:id` | `inventory.read` |
+| `POST` `PATCH` | `/inventory-counts`, `…/items`, `…/finalize`, `…/cancel` | `inventory.count` |
+| `GET` | `/transfers`, `/transfers/:id` | `inventory.read` |
+| `POST` | `/transfers`, `…/receive`, `…/cancel` | `inventory.transfer` |
+
+Warehouses reuse the existing permission catalogue rather than declaring a
+`warehouses.*` group. Reading one is `inventory.read` — a warehouse list with
+no stock in it is not something anyone asks for — and creating one is
+`stores.manage`, because a warehouse is part of how a store is structured. A
+new group would have to be granted to every existing role before anyone could
+use the feature.
+
+```bash
+# Stock across all warehouses, lowest first
+curl -s "$API/inventory?sort=quantity:asc&limit=20" -H "Authorization: Bearer $TOKEN"
+
+# The re-order list for one branch
+curl -s "$API/inventory?storeId=$STORE&lowStock=true" -H "Authorization: Bearer $TOKEN"
+
+# Write off three broken jars — reason is mandatory and enforced by the database
+curl -s -X POST "$API/inventory/adjustments" -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"warehouseId":"'$WH'","lines":[
+        {"variantId":"'$V'","quantity":"-3.000","reason":"DAMAGE","note":"Sindirilgan"}]}'
+
+# The stock card for one variant
+curl -s "$API/inventory/movements?variantId=$V" -H "Authorization: Bearer $TOKEN"
+
+# A stocktake, end to end
+curl -s -X POST "$API/inventory-counts" -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' -d '{"warehouseId":"'$WH'"}'
+curl -s -X PATCH "$API/inventory-counts/$C/items" -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"items":[{"variantId":"'$V'","countedQuantity":"47.000"}]}'
+curl -s -X POST "$API/inventory-counts/$C/finalize" -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' -d '{}'
+```
+
+---
+
 ## Foundation behaviour worth knowing
 
 **API versioning.** URI-based: every route lives under `/api/v1/...`. The
@@ -631,6 +936,12 @@ exponent 0, so `450000` means 450,000 so'm. Money is serialized as a JSON
 integer. There is no `Money` class — a `bigint` *is* the type, so
 `price * 1.2` is a `TypeError` rather than a silent float (*§8*).
 
+**Quantities.** A decimal string with three decimal places (`"1.500"`), in
+requests as well as responses. Stock is `NUMERIC(14,3)` — 1.5 kg of rice is a
+real quantity — and a string keeps the parsing decision in the one place that
+knows the scale. The client here is a Flutter app whose `double` loses
+`0.1 + 0.2` exactly as JavaScript's does.
+
 **Security baseline.** Helmet (HSTS in production, `X-Frame-Options: DENY`,
 `no-referrer`), an explicit CORS allow-list, a 1 MB body limit, and global rate
 limiting. Health probes skip the throttle so monitoring cannot trip it.
@@ -645,11 +956,12 @@ Sprint 1 is the foundation. Phases follow *§33 Implementation order*:
 |---|---|---|
 | **1 ✅** | Foundation: config, Prisma, errors, logging, health, Docker, tests | `docker compose up` serves `/health`; money tests green |
 | **2 ✅** | Tenancy & auth: Organization, Store, Warehouse, User, Role, StoreMembership, JWT + refresh rotation, guard chain, Prisma tenant extension, audit service | the tenant-isolation suite passes |
-| **3 ✅** | Catalog: Category, Product, ProductVariant, barcode lookup, search |
-| **4** | Inventory core: levels, movements, the single `apply()` write path |
-| 5 | Cash register: registers, shifts, movements |
-| 6 | Sales / POS: pricing pipeline, checkout transaction, payments, idempotency |
-| 7+ | Customers & debt, returns & exchanges, procurement, counts & transfers, loyalty, reporting |
+| **3 ✅** | Catalog: Category, Product, ProductVariant, barcode lookup, search | the catalog suite passes |
+| **4 ✅** | Inventory: levels, the movement ledger, the single `apply()` write path, warehouses, counts, transfers | the projection equals the ledger under parallel load |
+| 5 | Sales / POS: pricing pipeline, checkout transaction, payments, idempotency |
+| 6 | Customers & debt: receivables, debt payments, balances |
+| 7 | Procurement: suppliers, purchases, receiving, payables |
+| 8+ | Returns & exchanges, discounts & loyalty, cash register, reporting |
 
 ---
 
