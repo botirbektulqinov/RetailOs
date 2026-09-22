@@ -239,6 +239,7 @@ src/
     pricing.ts             the §10.3 calculation pipeline, pure and testable
   customers/               customers, groups, notes and the debt ledger
   procurement/             suppliers, purchase orders, receiving and payables
+  returns/                 returns, refunds and exchanges
   audit/                   the append-only audit trail
   common/
     money/                 Money primitives: bigint minor units (§8)
@@ -258,7 +259,8 @@ prisma/
   seed.ts
 test/
   setup-e2e.ts             raises the auth throttle before anything imports
-  foundation · auth · catalog · inventory · sales · customers · procurement  .e2e-spec.ts
+  foundation · auth · catalog · inventory · sales
+  customers · procurement · returns                .e2e-spec.ts
   helpers/seed-org.ts      two complete look-alike organizations, for isolation probes
 docs/
   ARCHITECTURE.md          the source of truth
@@ -1431,6 +1433,178 @@ curl -s "$API/suppliers?hasPayable=true&sort=payable:desc" -H "Authorization: Be
 
 ---
 
+## Returns and exchanges
+
+A return is a **compensating transaction**. The original sale is never deleted
+and its figures are never rewritten — only `refunded_amount` and
+`return_status` move, and both are derived from the returns that reference it.
+A receipt reprinted next year still says what it said on the day.
+
+### The quantity guard
+
+```
+returnable = sale_item.quantity − sale_item.returned_quantity
+```
+
+Enforced as a conditional `UPDATE`, in the same transaction as everything else:
+
+```sql
+UPDATE sale_item
+   SET returned_quantity = returned_quantity + $qty,
+       refunded_amount   = refunded_amount   + $refund
+ WHERE id = $saleItemId
+   AND returned_quantity + $qty <= quantity;
+```
+
+Zero rows → **409 `RETURN_QUANTITY_EXCEEDED`**, carrying the actual returnable
+quantity so the client can correct itself. Sold 10, returned 3, asked for 8:
+refused, with `returnable: "7.000"` in the payload. Two parallel returns of the
+last unit: exactly one succeeds.
+
+`CHECK (returned_quantity <= quantity)` is the backstop if a future code path
+forgets the guard — it turns a data-corruption bug into a failed transaction.
+
+`GET /returns/returnable/:saleId` gives the POS the per-line numbers before it
+draws the screen, so the cashier never types a quantity the server will reject.
+
+### The refund, and the rounding trap
+
+The refund reflects the line's **net** amount — after its own discount *and*
+its share of the order discount. A customer who bought at a discount is
+refunded at that discount, not at the list price.
+
+```
+unit_refund = roundHalfUp(sale_item.net_amount × return_qty, sale_item.quantity)
+```
+
+That drifts. Three returns of 1 unit from a line of 3 at net 100,000 give
+33,333 × 3 = 99,999, leaving one soʻm the customer never gets back.
+
+**On the return that closes the line**, the refund is the exact remainder:
+
+```
+unit_refund = sale_item.net_amount − sale_item.refunded_amount
+```
+
+The last return sweeps up the residue and the line always reconciles to zero.
+Same technique as `allocate()`, applied over time instead of across lines — and
+there is a test that returns 1, 1, 1 from a line of 3 and asserts the three
+refunds sum to exactly the line's net.
+
+### Restock
+
+| `restock` | `condition` | Effect |
+|---|---|---|
+| `true` | `SELLABLE` | `RETURN` movement, `+qty`, into the return's warehouse |
+| `false` | any | no movement |
+| any | `DAMAGED` | no movement — and the database enforces it |
+
+Damaged goods never re-enter sellable stock. If they physically came back and
+are being scrapped, the operator records a separate `DAMAGE` movement:
+"returned" and "written off" are different facts, and merging them hides
+shrinkage.
+
+### Where the money goes
+
+Decided by the sale's payment state, in this order (*§13.5*):
+
+1. **An open receivable on the sale is offset first.** Refunding cash to
+   somebody who still owes you money is a mistake the system should not make on
+   its own. The offset is a `Payment IN` allocated to the receivable, so its
+   `paid_amount` rises through the same guarded `UPDATE` as any other
+   collection. `written_off_amount` is **not** touched — that column means bad
+   debt, and a return is not bad debt.
+2. **Whatever exceeds the debt** becomes a `Payment OUT` allocated to the
+   return.
+
+Return 3 of 5 on a sale that was 400,000 cash + 100,000 credit: 100,000 clears
+the debt, 200,000 comes back as cash, and the balance lands on zero — never
+below it.
+
+### Return window
+
+`organization_settings.return_window_days`, default 14, zero means no limit.
+Outside the window a return needs `sales.refund_expired` and always leaves an
+audit trail. A manager holds `sales.refund` but not `sales.refund_expired`, so
+an old return is an explicit escalation rather than something that quietly
+works.
+
+### Idempotency
+
+Mandatory. A double-tapped refund button that pays a customer twice is the
+single most expensive bug a POS can ship.
+
+### Exchanges
+
+An exchange is **a return and a sale that happen together**, linked by one
+`Exchange` row. Modelling it as a third kind of line-item document would
+duplicate the stock logic, the refund logic and the debt logic that both
+already implement with their guards.
+
+```
+net_amount = replacement_value − returned_value
+```
+
+| Case | `net` | Settlement |
+|---|---|---|
+| return 500,000 → take 650,000 | +150,000 | `CUSTOMER_PAID` |
+| return 500,000 → take 500,000 | 0 | `EVEN` |
+| return 650,000 → take 500,000 | −150,000 | `REFUNDED` |
+| return 500,000 → take 650,000, on credit | +150,000 | `CREDITED_TO_DEBT` |
+
+A `CHECK` ties the settlement to the sign of the net, so an `EVEN` exchange
+that owes money cannot be persisted.
+
+**Only the net moves as money.** Recording 500,000 out and 650,000 in would
+double-count the day's revenue, make the drawer expect 500,000 that never left
+it, and ask the cashier to handle cash they never touched.
+
+> The goods handed back still have to settle the replacement sale, which must
+> satisfy `paid + credit = total`. They are recorded as an allocation of method
+> `OTHER` — a **trade-in**, neither cash nor credit. The only `CASH` row is the
+> net that actually crossed the counter, so the drawer stays honest while the
+> sale still reconciles against its own allocations. This is not in §14.4,
+> which describes the cash movement only; without it the replacement sale's
+> arithmetic has no legal value.
+
+Both stock legs are ordinary movements: `RETURN +1` of the old variant,
+`SALE −1` of the new one with its normal insufficient-stock guard. **If the
+replacement is out of stock the whole exchange fails and nothing is written** —
+which comes free from running both legs in one transaction.
+
+### Endpoints
+
+| Method | Path | Permission |
+|---|---|---|
+| `GET` | `/returns` | `sales.read` |
+| `GET` | `/returns/returnable/:saleId` | `sales.read` |
+| `GET` | `/returns/:id` | `sales.read` |
+| `POST` | `/returns` | `sales.refund` + `Idempotency-Key` |
+| `POST` | `/exchanges` | `sales.refund` + `Idempotency-Key` |
+
+A cashier may sell but not refund. A sale that has been returned against can no
+longer be cancelled: two mechanisms undoing the same money is how a refund gets
+paid twice.
+
+```bash
+# What can still come back
+curl -s "$API/returns/returnable/$SALE" -H "Authorization: Bearer $TOKEN"
+
+# Return 1 of 3, damaged - money back, goods stay off the shelf
+curl -s -X POST "$API/returns" -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' -H "Idempotency-Key: $(uuidgen)" \
+  -d '{"saleId":"SALE","items":[{"saleItemId":"LINE","quantity":"1.000","condition":"DAMAGED"}],
+       "reason":"DEFECTIVE"}'
+
+# Swap it for something dearer - the customer pays only the difference
+curl -s -X POST "$API/exchanges" -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' -H "Idempotency-Key: $(uuidgen)" \
+  -d '{"saleId":"SALE","returnItems":[{"saleItemId":"LINE","quantity":"1.000"}],
+       "replacementItems":[{"variantId":"V2","quantity":"1.000"}],"reason":"WRONG_ITEM"}'
+```
+
+---
+
 ## Foundation behaviour worth knowing
 
 **API versioning.** URI-based: every route lives under `/api/v1/...`. The
@@ -1502,7 +1676,9 @@ Sprint 1 is the foundation. Phases follow *§33 Implementation order*:
 | **5 ✅** | Sales / POS: pricing pipeline, checkout transaction, mixed payments, idempotency, cancellation | a sale's own figures cannot disagree — the database checks them |
 | **6 ✅** | Customers & debt: groups, notes, receivables, FIFO collection, write-off | no debt and no payment can disappear; over-payment is refused |
 | **7 ✅** | Procurement: suppliers, purchase orders, partial receiving, payables | over-receipt and over-payment are both refused by the database |
-| 8+ | Returns & exchanges, discounts & loyalty, cash register, reporting |
+| **8 ✅** | Returns & exchanges: quantity guard, net refunds, debt offset, net settlement | a line can never be over-returned, and a partial return strands no soʻm |
+| 9 | Discounts, promotions, loyalty and cashback |
+| 10+ | Cash register and shifts, reporting, notifications |
 
 ---
 

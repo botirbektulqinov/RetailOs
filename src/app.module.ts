@@ -20,6 +20,7 @@ import { InventoryModule } from './inventory/inventory.module';
 import { OrganizationsModule } from './organizations/organizations.module';
 import { ProcurementModule } from './procurement/procurement.module';
 import { RbacModule } from './rbac/rbac.module';
+import { ReturnsModule } from './returns/returns.module';
 import { SalesModule } from './sales/sales.module';
 import { StoresModule } from './stores/stores.module';
 
@@ -64,6 +65,7 @@ import { StoresModule } from './stores/stores.module';
     SalesModule,
     CustomersModule,
     ProcurementModule,
+    ReturnsModule,
     HealthModule,
   ],
   providers: [

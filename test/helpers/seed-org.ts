@@ -220,6 +220,14 @@ export async function dropTestOrg(db: PrismaClient, organizationId: string): Pro
   } finally {
     await db.$executeRaw`ALTER TABLE payment_allocation ENABLE TRIGGER tg_payment_allocation_immutable`;
   }
+  // Returns and exchanges before sales: return lines reference sale lines,
+  // and an exchange references both the return and the replacement sale.
+  await db.exchange.updateMany({ where: { organizationId }, data: {} });
+  await db.saleReturn.updateMany({ where: { organizationId }, data: { exchangeId: null } });
+  await db.exchange.deleteMany({ where: { organizationId } });
+  await db.returnItem.deleteMany({ where: { organizationId } });
+  await db.saleReturn.deleteMany({ where: { organizationId } });
+
   await db.customerReceivable.deleteMany({ where: { organizationId } });
   await db.payment.deleteMany({ where: { organizationId } });
   await db.saleItem.deleteMany({ where: { organizationId } });

@@ -521,6 +521,7 @@ model ProductVariant {
   transferItems StockTransferItem[]
   saleItems     SaleItem[]
   purchaseItems PurchaseItem[]
+  returnItems   ReturnItem[]
 
   @@unique([organizationId, id])
   @@index([organizationId, barcode])
@@ -885,6 +886,8 @@ model Customer {
   payments    Payment[]
   receivables CustomerReceivable[]
   notes       CustomerNote[]
+  returns     SaleReturn[]
+  exchanges   Exchange[]
 
   @@unique([organizationId, id])
   @@index([organizationId, fullName])
@@ -1004,11 +1007,13 @@ model Sale {
   createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
   updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
 
-  store       Store               @relation(fields: [storeId], references: [id])
-  customer    Customer?           @relation(fields: [customerId], references: [id])
-  items       SaleItem[]
-  allocations PaymentAllocation[]
-  receivable  CustomerReceivable?
+  store                 Store               @relation(fields: [storeId], references: [id])
+  customer              Customer?           @relation(fields: [customerId], references: [id])
+  items                 SaleItem[]
+  allocations           PaymentAllocation[]
+  receivable            CustomerReceivable?
+  returns               SaleReturn[]
+  exchangeAsReplacement Exchange?           @relation("ExchangeSale")
 
   @@unique([organizationId, id])
   @@unique([organizationId, storeId, saleNumber])
@@ -1049,8 +1054,9 @@ model SaleItem {
 
   position Int @db.SmallInt
 
-  sale    Sale           @relation(fields: [saleId], references: [id], onDelete: Cascade)
-  variant ProductVariant @relation(fields: [productVariantId], references: [id])
+  sale        Sale           @relation(fields: [saleId], references: [id], onDelete: Cascade)
+  variant     ProductVariant @relation(fields: [productVariantId], references: [id])
+  returnItems ReturnItem[]
 
   @@unique([organizationId, id])
   @@unique([saleId, position])
@@ -1109,6 +1115,7 @@ model PaymentAllocation {
 
   saleId       String? @map("sale_id") @db.Uuid
   receivableId String? @map("receivable_id") @db.Uuid
+  returnId     String? @map("return_id") @db.Uuid
 
   amount BigInt
 
@@ -1117,10 +1124,12 @@ model PaymentAllocation {
   payment    Payment             @relation(fields: [paymentId], references: [id], onDelete: Cascade)
   sale       Sale?               @relation(fields: [saleId], references: [id])
   receivable CustomerReceivable? @relation(fields: [receivableId], references: [id])
+  saleReturn SaleReturn?         @relation(fields: [returnId], references: [id])
 
   @@unique([organizationId, id])
   @@index([saleId])
   @@index([receivableId])
+  @@index([returnId])
   @@index([paymentId])
   @@map("payment_allocation")
 }
@@ -1356,4 +1365,148 @@ model SupplierPayment {
   @@index([organizationId, supplierId, paidAt(sort: Desc)])
   @@index([purchaseId])
   @@map("supplier_payment")
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Returns and exchanges (Sprint 8)
+// ──────────────────────────────────────────────────────────────────────────
+
+enum ReturnReason {
+  DEFECTIVE
+  WRONG_ITEM
+  CHANGED_MIND
+  EXPIRED
+  OTHER
+}
+
+/// Whether the goods can go back on the shelf. DAMAGED never restocks, so
+/// "returned" and "written off" stay different facts — merging them hides
+/// shrinkage.
+enum ItemCondition {
+  SELLABLE
+  DAMAGED
+}
+
+enum ExchangeSettlement {
+  CUSTOMER_PAID
+  REFUNDED
+  EVEN
+  CREDITED_TO_DEBT
+}
+
+/// A compensating transaction. The original sale is never deleted and its
+/// figures are never rewritten; only `refunded_amount` and `return_status`
+/// move, and both are derived from the returns that reference it.
+///
+/// Physically `sale_return`, because `return` is reserved in PostgreSQL.
+model SaleReturn {
+  id             String @id @default(uuid()) @db.Uuid
+  organizationId String @map("organization_id") @db.Uuid
+  storeId        String @map("store_id") @db.Uuid
+  saleId         String @map("sale_id") @db.Uuid
+
+  /// Where restocked goods go. Recorded rather than inferred, because a
+  /// store's default warehouse can change between the sale and the return.
+  warehouseId String  @map("warehouse_id") @db.Uuid
+  customerId  String? @map("customer_id") @db.Uuid
+
+  returnNumber String       @map("return_number")
+  reason       ReturnReason
+  reasonNote   String?      @map("reason_note")
+
+  /// Money actually handed back.
+  refundAmount BigInt @map("refund_amount")
+
+  /// Written off an open receivable instead of refunded (§13.5). Refunding
+  /// cash to somebody who still owes you money is a mistake the system should
+  /// not make on its own.
+  creditOffsetAmount BigInt @default(0) @map("credit_offset_amount")
+
+  /// Set when this return is one leg of an exchange.
+  exchangeId String? @unique @map("exchange_id") @db.Uuid
+
+  createdBy String   @map("created_by") @db.Uuid
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  sale        Sale                @relation(fields: [saleId], references: [id])
+  customer    Customer?           @relation(fields: [customerId], references: [id])
+  items       ReturnItem[]
+  allocations PaymentAllocation[]
+  exchange    Exchange?           @relation("ExchangeReturn", fields: [exchangeId], references: [id])
+
+  @@unique([organizationId, id])
+  @@unique([organizationId, storeId, returnNumber])
+  @@index([organizationId, saleId])
+  @@index([organizationId, createdAt(sort: Desc)])
+  @@index([organizationId, customerId, createdAt(sort: Desc)])
+  @@map("sale_return")
+}
+
+model ReturnItem {
+  id               String @id @default(uuid()) @db.Uuid
+  organizationId   String @map("organization_id") @db.Uuid
+  returnId         String @map("return_id") @db.Uuid
+  saleItemId       String @map("sale_item_id") @db.Uuid
+  productVariantId String @map("product_variant_id") @db.Uuid
+
+  quantity Decimal @db.Decimal(14, 3)
+
+  /// What this unit is actually worth back: the line's NET share, not the list
+  /// price. A customer who bought at a discount is refunded at that discount.
+  unitRefundAmount BigInt @map("unit_refund_amount")
+  refundAmount     BigInt @map("refund_amount")
+
+  restock   Boolean       @default(true)
+  condition ItemCondition @default(SELLABLE)
+
+  saleReturn SaleReturn     @relation(fields: [returnId], references: [id], onDelete: Cascade)
+  saleItem   SaleItem       @relation(fields: [saleItemId], references: [id])
+  variant    ProductVariant @relation(fields: [productVariantId], references: [id])
+
+  @@unique([organizationId, id])
+  @@unique([returnId, saleItemId])
+  @@index([organizationId, productVariantId])
+  @@map("return_item")
+}
+
+/// A composite, not a third kind of line-item document (§14.1).
+///
+/// An exchange IS a return plus a sale. Modelling it separately would
+/// duplicate the stock logic, the refund logic and the debt logic that both
+/// already implement correctly. This row exists only to link the pair, record
+/// the settlement, and stop reporting counting the replacement as organic
+/// revenue.
+model Exchange {
+  id             String @id @default(uuid()) @db.Uuid
+  organizationId String @map("organization_id") @db.Uuid
+  storeId        String @map("store_id") @db.Uuid
+
+  exchangeNumber String @map("exchange_number")
+
+  returnId          String @unique @map("return_id") @db.Uuid
+  replacementSaleId String @unique @map("replacement_sale_id") @db.Uuid
+
+  customerId String? @map("customer_id") @db.Uuid
+
+  returnedValue    BigInt @map("returned_value")
+  replacementValue BigInt @map("replacement_value")
+
+  /// replacement − returned. Positive: the customer pays. Negative: refund.
+  netAmount BigInt @map("net_amount")
+
+  settlement ExchangeSettlement
+
+  createdBy String   @map("created_by") @db.Uuid
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  saleReturn      SaleReturn? @relation("ExchangeReturn")
+  replacementSale Sale        @relation("ExchangeSale", fields: [replacementSaleId], references: [id])
+  customer        Customer?   @relation(fields: [customerId], references: [id])
+
+  @@unique([organizationId, id])
+  @@unique([organizationId, storeId, exchangeNumber])
+  @@index([organizationId, createdAt(sort: Desc)])
+  @@map("exchange")
 }

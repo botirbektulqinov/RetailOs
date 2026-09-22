@@ -51,6 +51,9 @@ const TENANT_MODELS = new Set<string>([
   'Purchase',
   'PurchaseItem',
   'SupplierPayment',
+  'SaleReturn',
+  'ReturnItem',
+  'Exchange',
 ]);
 
 /** Operations whose `where` must be narrowed to the tenant. */
