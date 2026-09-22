@@ -240,6 +240,8 @@ src/
   customers/               customers, groups, notes and the debt ledger
   procurement/             suppliers, purchase orders, receiving and payables
   returns/                 returns, refunds and exchanges
+  loyalty/                 promotions, the points ledger
+    ../sales/promotions.ts the §18.3 resolver, pure and testable
   audit/                   the append-only audit trail
   common/
     money/                 Money primitives: bigint minor units (§8)
@@ -260,13 +262,13 @@ prisma/
 test/
   setup-e2e.ts             raises the auth throttle before anything imports
   foundation · auth · catalog · inventory · sales
-  customers · procurement · returns                .e2e-spec.ts
+  customers · procurement · returns · loyalty      .e2e-spec.ts
   helpers/seed-org.ts      two complete look-alike organizations, for isolation probes
 docs/
   ARCHITECTURE.md          the source of truth
 ```
 
-Remaining feature modules (`sales/`, `customers/`, `purchases/`, …) are **not**
+Remaining feature modules (`cash/`, `reports/`, `notifications/`) are **not**
 scaffolded as empty folders. They are created by the sprint that implements
 them — see *§30* for the planned layout and the module boundary rules.
 
@@ -1605,6 +1607,169 @@ curl -s -X POST "$API/exchanges" -H "Authorization: Bearer $TOKEN" \
 
 ---
 
+## Discounts, promotions and loyalty
+
+### Two levels, one winner each
+
+| Level | Stored on | Set by |
+|---|---|---|
+| Item | `sale_item.line_discount_amount` | manual line discount, or an `ITEM` promotion |
+| Order | `sale.order_discount_amount`, allocated per line | manual order discount, a customer group's standing percent, or an `ORDER` promotion |
+
+Both are stored as **money amounts**, never percentages. A percentage is an
+input; the resolved amount is the fact. Storing the percent means every read
+recomputes, and the recomputation drifts the moment a rounding rule changes.
+
+### Promotions do not stack
+
+At each level exactly one wins, by `priority DESC, value DESC`. A manual
+discount beats a promotion only if it is larger.
+
+Stacking needs a combinability matrix, an application order, and an answer for
+what "20% off plus 10,000 off" means applied the other way round. None of that
+is specified, and inventing it produces a system where the cashier cannot
+predict the price. Non-stacking is explicit, testable and reversible.
+
+The resolution lives in [promotions.ts](src/sales/promotions.ts) — pure
+functions, no database and no clock, so every rule is testable in a
+millisecond. The service that owns the rows is separate and only reads them.
+
+### Calculation order — normative
+
+```
+1.  gross      = roundHalfUp(unit_price × quantity)              per line
+2.  line_disc  = max(best ITEM promotion, manual line discount)  capped at gross
+3.  subtotal₀  = Σ (gross − line_disc)
+4.  order_disc = best of { manual, ORDER promotion, group % }    capped at subtotal₀
+5.  allocate(order_disc, weights = gross − line_disc)            sums exactly
+6.  net        = gross − line_disc − allocated_order_discount    per line
+7.  subtotal   = Σ (gross − line_disc)          ← the pre-order-discount figure
+8.  tax        = 0                                               reserved
+9.  rounding   = cash rounding, cash tenders only
+10. total      = subtotal − order_disc + tax + rounding
+11. loyalty redemption applies HERE, as a payment — not as a discount
+```
+
+An item promotion then an order promotion: 100,000 − 10% line = 90,000, then
+− 10% order = **81,000**. Applying both to the gross would have given 80,000,
+and a later partial return would refund the wrong amount.
+
+A percentage can carry a `maxDiscount`, so "50% off" on a large basket does not
+become an unbounded giveaway. Nothing can take a line below zero.
+
+### Targeting and eligibility
+
+| | |
+|---|---|
+| `appliesTo` | `ALL`, `CATEGORY` (+ `categoryIds`), `PRODUCT` (+ `productIds`) |
+| `customerGroupIds` | empty = everybody; populated = only those groups, **never a walk-in** |
+| `startsAt` / `endsAt` | the window; `endsAt` null means open-ended |
+| `minSubtotal` | for `ORDER`, checked against the subtotal **after** line discounts |
+| `maxUses` / `usedCount` | a campaign that has run out stops applying |
+
+A `CHECK` refuses a targeted promotion that targets nothing — "CATEGORY, no
+categories" silently means "nothing", so the campaign never fires while the
+screen looks entirely correct.
+
+A promotion is **deactivated, never deleted**: sales reference the campaign
+that priced them, and one nobody can look up afterwards is a discount nobody
+can explain.
+
+### Loyalty
+
+```
+LoyaltyAccount.points_balance   CACHE — convenient, never authoritative
+  └── LoyaltyTransaction[]      APPEND-ONLY — the truth
+        EARN | SPEND | ADJUSTMENT | EXPIRY
+```
+
+The same projection-plus-ledger shape as inventory, for the same reason. The
+cache is only ever written inside the transaction that writes the ledger row,
+so `points_balance = SUM(points_delta)` (BR-10) is assertable at any moment —
+and the suite asserts it.
+
+Points move through one method that mirrors `InventoryService.apply()`: a
+conditional `UPDATE` that both mutates and guards, then the ledger row carrying
+the balance that resulted. Zero rows means the balance would have gone
+negative: **points that were never earned cannot be spent**, and two tills
+cannot redeem the same points.
+
+| Setting | |
+|---|---|
+| `loyalty_earn_percent` | percent of the sale's subtotal earned as points |
+| `loyalty_point_value` | money minor units one point redeems for |
+
+Points are earned on the **subtotal** — the net of discounts — so cash rounding
+does not leak into loyalty and a discounted sale does not also generate full
+points.
+
+### Redemption is a payment, not a discount
+
+This is the distinction the whole module turns on.
+
+A discount reduces revenue. A redemption settles revenue with a liability the
+store already recognised when the points were earned. Treating redemption as a
+discount understates revenue, corrupts margin, and makes the outstanding points
+liability invisible.
+
+So `{ "method": "LOYALTY", "amount": 5000 }` is an ordinary tender in
+`payments[]`, it creates a `Payment` of method `LOYALTY` allocated to the sale,
+and `subtotal_amount` does not move:
+
+```
+sale total     100,000      ← unchanged
+payments       LOYALTY 5,000 + CASH 95,000
+points          −5,000 SPEND, then +1,000 EARN on this sale
+```
+
+### Returns reverse the points
+
+Proportionally to the returned value, **clamped at the balance**. If the
+customer has already spent them, the shortfall is recorded in `reason` rather
+than driving the balance negative — clawing back points somebody already used
+is a policy decision, not a default.
+
+### What is deliberately not here
+
+- **`BUY_X_GET_Y`** — needs a free-item line, its own returns behaviour and a
+  stock effect, none of which the design specifies. `PERCENT_OFF` and
+  `FIXED_OFF` cover every screen that exists.
+- **Point expiry** — the `expires_at` column exists and nothing writes it.
+  Expiry needs a policy (rolling window? calendar year? per-transaction FIFO?)
+  that has not been specified. When it arrives it is a cron job inserting
+  `EXPIRY` rows; the column is there so the ledger never needs migrating.
+- **A discount ceiling per role** — `max_discount_percent` is a natural next
+  step and no screen specifies it.
+
+### Endpoints
+
+| Method | Path | Permission |
+|---|---|---|
+| `GET` | `/promotions`, `/promotions/:id` | `promotions.read` |
+| `POST` `PATCH` | `/promotions`, `/promotions/:id`, `…/deactivate` | `promotions.manage` |
+| `GET` | `/loyalty/:customerId`, `…/history` | `loyalty.read` |
+| `POST` | `/loyalty/:customerId/adjust` | `loyalty.adjust` |
+
+```bash
+# 15% off one product, from yesterday, no end date
+curl -s -X POST "$API/promotions" -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"Kuzgi 15%","type":"PERCENT_OFF","scope":"ITEM","value":15,
+       "appliesTo":"PRODUCT","productIds":["PRODUCT_ID"],"startsAt":"2026-09-21T00:00:00Z"}'
+
+# Pay partly with points - a tender, not a discount
+curl -s -X POST "$API/sales/checkout" -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' -H "Idempotency-Key: $(uuidgen)" \
+  -d '{"items":[{"variantId":"V","quantity":"1.000"}],
+       "payments":[{"method":"LOYALTY","amount":153},{"method":"CASH","amount":15147}],
+       "customerId":"CUSTOMER_ID"}'
+
+# The ledger behind the balance
+curl -s "$API/loyalty/$CUSTOMER/history" -H "Authorization: Bearer $TOKEN"
+```
+
+---
+
 ## Foundation behaviour worth knowing
 
 **API versioning.** URI-based: every route lives under `/api/v1/...`. The
@@ -1677,7 +1842,7 @@ Sprint 1 is the foundation. Phases follow *§33 Implementation order*:
 | **6 ✅** | Customers & debt: groups, notes, receivables, FIFO collection, write-off | no debt and no payment can disappear; over-payment is refused |
 | **7 ✅** | Procurement: suppliers, purchase orders, partial receiving, payables | over-receipt and over-payment are both refused by the database |
 | **8 ✅** | Returns & exchanges: quantity guard, net refunds, debt offset, net settlement | a line can never be over-returned, and a partial return strands no soʻm |
-| 9 | Discounts, promotions, loyalty and cashback |
+| **9 ✅** | Discounts, promotions and loyalty: one winner per level, points as a tender | a balance always equals its own ledger, and promotions never stack |
 | 10+ | Cash register and shifts, reporting, notifications |
 
 ---

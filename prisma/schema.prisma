@@ -881,13 +881,14 @@ model Customer {
   createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
   updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
 
-  group       CustomerGroup?       @relation(fields: [customerGroupId], references: [id])
-  sales       Sale[]
-  payments    Payment[]
-  receivables CustomerReceivable[]
-  notes       CustomerNote[]
-  returns     SaleReturn[]
-  exchanges   Exchange[]
+  group          CustomerGroup?       @relation(fields: [customerGroupId], references: [id])
+  sales          Sale[]
+  payments       Payment[]
+  receivables    CustomerReceivable[]
+  notes          CustomerNote[]
+  returns        SaleReturn[]
+  exchanges      Exchange[]
+  loyaltyAccount LoyaltyAccount?
 
   @@unique([organizationId, id])
   @@index([organizationId, fullName])
@@ -989,6 +990,9 @@ model Sale {
   /// lookup of a cost that has since moved.
   costAmount BigInt @default(0) @map("cost_amount")
 
+  /// Which promotion produced the order discount, if one did. Reporting needs
+  /// to attribute a discount to the campaign that caused it.
+  promotionId    String? @map("promotion_id") @db.Uuid
   discountReason String? @map("discount_reason")
   note           String?
 
@@ -1051,6 +1055,9 @@ model SaleItem {
 
   returnedQuantity Decimal @default(0) @map("returned_quantity") @db.Decimal(14, 3)
   refundedAmount   BigInt  @default(0) @map("refunded_amount")
+
+  /// Which ITEM-scope promotion produced this line's discount, if one did.
+  promotionId String? @map("promotion_id") @db.Uuid
 
   position Int @db.SmallInt
 
@@ -1509,4 +1516,147 @@ model Exchange {
   @@unique([organizationId, storeId, exchangeNumber])
   @@index([organizationId, createdAt(sort: Desc)])
   @@map("exchange")
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Promotions and loyalty (Sprint 9)
+// ──────────────────────────────────────────────────────────────────────────
+
+enum PromotionType {
+  PERCENT_OFF
+  FIXED_OFF
+}
+
+enum PromotionScope {
+  ITEM
+  ORDER
+}
+
+enum PromotionTarget {
+  ALL
+  CATEGORY
+  PRODUCT
+}
+
+enum LoyaltyTransactionType {
+  EARN
+  SPEND
+  ADJUSTMENT
+  EXPIRY
+}
+
+/// A promotion is a rule; the discount it produces is a money amount stored on
+/// the sale. The rule can change tomorrow without altering what yesterday's
+/// receipt says.
+///
+/// BUY_X_GET_Y from the draft is deliberately absent: it needs a free-item
+/// line, its own returns behaviour and a stock effect, none of which the
+/// design specifies. PERCENT_OFF and FIXED_OFF cover every screen that exists.
+model Promotion {
+  id             String @id @default(uuid()) @db.Uuid
+  organizationId String @map("organization_id") @db.Uuid
+
+  name        String
+  description String?
+
+  type  PromotionType
+  scope PromotionScope
+
+  /// Percent (2dp) for PERCENT_OFF, minor units for FIXED_OFF. Which one it
+  /// means is decided by `type`, never guessed.
+  value Decimal @db.Decimal(14, 2)
+
+  /// The order must reach this before an ORDER promotion applies.
+  minSubtotal BigInt? @map("min_subtotal")
+
+  /// A ceiling on a PERCENT_OFF, so "20% off" on a large basket cannot become
+  /// an unbounded giveaway.
+  maxDiscount BigInt? @map("max_discount")
+
+  appliesTo PromotionTarget @default(ALL) @map("applies_to")
+
+  /// Arrays rather than join tables: a promotion targets a handful of things,
+  /// is read once per checkout, and is edited as a whole. Three join tables
+  /// would buy referential integrity on a list the UI replaces wholesale.
+  categoryIds      String[] @default([]) @map("category_ids") @db.Uuid
+  productIds       String[] @default([]) @map("product_ids") @db.Uuid
+  customerGroupIds String[] @default([]) @map("customer_group_ids") @db.Uuid
+
+  startsAt DateTime  @map("starts_at") @db.Timestamptz(6)
+  endsAt   DateTime? @map("ends_at") @db.Timestamptz(6)
+
+  isActive Boolean @default(true) @map("is_active")
+
+  /// Higher wins first; ties break on the larger computed value (§18.3).
+  priority Int @default(0) @db.SmallInt
+
+  maxUses   Int? @map("max_uses")
+  usedCount Int  @default(0) @map("used_count")
+
+  version Int @default(0)
+
+  createdBy String?  @map("created_by") @db.Uuid
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@unique([organizationId, id])
+  @@index([organizationId, isActive, startsAt, endsAt])
+  @@map("promotion")
+}
+
+/// The cached balance. Convenient, never authoritative.
+///
+/// Written only inside the same transaction as the LoyaltyTransaction that
+/// changes it, and reconcilable against SUM(points_delta) — the same
+/// projection-plus-ledger pattern as inventory, for the same reason.
+model LoyaltyAccount {
+  id             String @id @default(uuid()) @db.Uuid
+  organizationId String @map("organization_id") @db.Uuid
+  customerId     String @unique @map("customer_id") @db.Uuid
+
+  pointsBalance  BigInt @default(0) @map("points_balance")
+  lifetimeEarned BigInt @default(0) @map("lifetime_earned")
+  lifetimeSpent  BigInt @default(0) @map("lifetime_spent")
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  customer     Customer             @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  transactions LoyaltyTransaction[]
+
+  @@unique([organizationId, id])
+  @@map("loyalty_account")
+}
+
+/// Append-only, like the inventory ledger and the payment allocations. A
+/// points balance that can be edited is a currency anybody can print.
+model LoyaltyTransaction {
+  id               String                 @id @default(uuid()) @db.Uuid
+  organizationId   String                 @map("organization_id") @db.Uuid
+  loyaltyAccountId String                 @map("loyalty_account_id") @db.Uuid
+  type             LoyaltyTransactionType
+
+  /// Signed, never zero.
+  pointsDelta  BigInt @map("points_delta")
+  balanceAfter BigInt @map("balance_after")
+
+  saleId   String? @map("sale_id") @db.Uuid
+  returnId String? @map("return_id") @db.Uuid
+
+  reason String?
+
+  /// Declared now so the ledger never needs migrating. Nothing writes it:
+  /// expiry needs a policy — rolling window, calendar year, per-transaction
+  /// FIFO — that has not been specified.
+  expiresAt DateTime? @map("expires_at") @db.Timestamptz(6)
+
+  createdBy String?  @map("created_by") @db.Uuid
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  account LoyaltyAccount @relation(fields: [loyaltyAccountId], references: [id], onDelete: Cascade)
+
+  @@unique([organizationId, id])
+  @@index([loyaltyAccountId, createdAt(sort: Desc)])
+  @@index([organizationId, saleId])
+  @@map("loyalty_transaction")
 }

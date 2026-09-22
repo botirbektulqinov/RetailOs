@@ -31,6 +31,9 @@ export interface PricedLineInput {
   unitCost: Money;
   /** Manual per-line discount, already validated against the caller's rights. */
   lineDiscount?: Money;
+  /** The best ITEM promotion for this line, resolved by the caller. */
+  promotionDiscount?: Money;
+  promotionId?: string;
 }
 
 export interface PricedLine {
@@ -47,6 +50,8 @@ export interface PricedLine {
   netAmount: Money;
   /** unit_cost x quantity, rounded once — this line's share of COGS. */
   lineCost: Money;
+  /** Set when a promotion, rather than a manual discount, won this line. */
+  promotionId: string | null;
   position: number;
 }
 
@@ -54,6 +59,9 @@ export interface PricingInput {
   lines: readonly PricedLineInput[];
   /** Manual order-level discount, already permission-checked. */
   orderDiscount?: Money;
+  /** The best ORDER-level candidate — promotion or customer group. */
+  orderPromotionDiscount?: Money;
+  orderPromotionId?: string | null;
   /** organization_settings.cash_rounding_unit; 0 disables rounding. */
   cashRoundingUnit?: bigint;
   /** Rounding applies only when the tender is entirely cash (§8.5). */
@@ -62,6 +70,8 @@ export interface PricingInput {
 
 export interface PricedSale {
   lines: PricedLine[];
+  /** Which promotion produced the order discount, if one did. */
+  orderPromotionId: string | null;
   subtotalAmount: Money;
   orderDiscountAmount: Money;
   taxAmount: Money;
@@ -85,8 +95,14 @@ export function priceSale(input: PricingInput): PricedSale {
     const quantityMilli = quantityToMilli(line.quantity);
     const grossAmount = priceTimesQuantity(line.unitPrice, quantityMilli);
 
-    const requested = line.lineDiscount ?? 0n;
+    // Step 2: the larger of the manual discount and the best ITEM promotion
+    // wins — they do not stack (§18.3). A cashier who hand-types less than the
+    // campaign already gives should not make the customer worse off.
+    const manual = line.lineDiscount ?? 0n;
+    const promotion = line.promotionDiscount ?? 0n;
+    const requested = manual >= promotion ? manual : promotion;
     const lineDiscountAmount = requested < 0n ? 0n : min(requested, grossAmount);
+    const promotionWon = promotion > 0n && promotion >= manual;
 
     return {
       variantId: line.variantId,
@@ -101,6 +117,7 @@ export function priceSale(input: PricingInput): PricedSale {
       allocatedOrderDiscount: 0n,
       netAmount: grossAmount - lineDiscountAmount,
       lineCost: priceTimesQuantity(line.unitCost, quantityMilli),
+      promotionId: promotionWon ? (line.promotionId ?? null) : null,
       position: index + 1,
     };
   });
@@ -108,8 +125,14 @@ export function priceSale(input: PricingInput): PricedSale {
   // 3: the base the order discount applies to.
   const subtotalBeforeOrderDiscount = sum(lines.map((l) => l.netAmount));
 
-  // 4: clamped, so an order discount cannot exceed what is being bought.
-  const requestedOrderDiscount = input.orderDiscount ?? 0n;
+  // 4: one winner at the order level too — the best of { manual, ORDER
+  // promotion, customer-group percent }. They do not stack (§18.3): a VIP who
+  // also catches a campaign gets the better of the two, not both. Clamped so
+  // the discount cannot exceed what is being bought.
+  const manualOrder = input.orderDiscount ?? 0n;
+  const promotionOrder = input.orderPromotionDiscount ?? 0n;
+  const requestedOrderDiscount = manualOrder >= promotionOrder ? manualOrder : promotionOrder;
+  const orderPromotionWon = promotionOrder > 0n && promotionOrder >= manualOrder;
   const orderDiscountAmount =
     requestedOrderDiscount < 0n ? 0n : min(requestedOrderDiscount, subtotalBeforeOrderDiscount);
 
@@ -158,6 +181,8 @@ export function priceSale(input: PricingInput): PricedSale {
 
   return {
     lines,
+    orderPromotionId:
+      orderPromotionWon && orderDiscountAmount > 0n ? (input.orderPromotionId ?? null) : null,
     subtotalAmount,
     orderDiscountAmount,
     taxAmount,

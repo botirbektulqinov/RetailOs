@@ -17,6 +17,7 @@ import { CustomersModule } from './customers/customers.module';
 import { EmployeesModule } from './employees/employees.module';
 import { HealthModule } from './health/health.module';
 import { InventoryModule } from './inventory/inventory.module';
+import { LoyaltyModule } from './loyalty/loyalty.module';
 import { OrganizationsModule } from './organizations/organizations.module';
 import { ProcurementModule } from './procurement/procurement.module';
 import { RbacModule } from './rbac/rbac.module';
@@ -66,6 +67,7 @@ import { StoresModule } from './stores/stores.module';
     CustomersModule,
     ProcurementModule,
     ReturnsModule,
+    LoyaltyModule,
     HealthModule,
   ],
   providers: [

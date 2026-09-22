@@ -79,12 +79,17 @@ export class SuppliersService {
     const order =
       field === 'payable'
         ? // By the numeric expression, not the text alias: ordering text would
-          // put "900000" above "1500000".
+          // put "900000" above "1500000". And by the SAME expression the
+          // filter and the response use — subtracting the unapplied credit —
+          // or a supplier we have paid in advance sorts as though we still
+          // owed the full invoice.
           desc
           ? Prisma.sql`ORDER BY COALESCE(SUM(p.total_amount - p.paid_amount)
-              FILTER (WHERE p.status IN ${Prisma.raw(PAYABLE_STATUSES)}), 0) DESC`
+              FILTER (WHERE p.status IN ${Prisma.raw(PAYABLE_STATUSES)}), 0)
+              - COALESCE(MAX(u.unapplied), 0) DESC`
           : Prisma.sql`ORDER BY COALESCE(SUM(p.total_amount - p.paid_amount)
-              FILTER (WHERE p.status IN ${Prisma.raw(PAYABLE_STATUSES)}), 0) ASC`
+              FILTER (WHERE p.status IN ${Prisma.raw(PAYABLE_STATUSES)}), 0)
+              - COALESCE(MAX(u.unapplied), 0) ASC`
         : desc
           ? Prisma.sql`ORDER BY s.name DESC`
           : Prisma.sql`ORDER BY s.name ASC`;

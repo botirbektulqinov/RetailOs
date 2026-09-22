@@ -12,6 +12,7 @@ import type { TenantContext } from '../common/tenant/tenant-context';
 import { PrismaService } from '../database/prisma.service';
 import type { Tx } from '../database/prisma.service';
 import { InventoryService } from '../inventory/inventory.service';
+import { LoyaltyService } from '../loyalty/loyalty.service';
 import type {
   CreateExchangeDto,
   ExchangeLineDto,
@@ -54,6 +55,7 @@ export class ReturnsService {
     private readonly prisma: PrismaService,
     private readonly inventory: InventoryService,
     private readonly idempotency: IdempotencyService,
+    private readonly loyalty: LoyaltyService,
     private readonly audit: AuditService,
   ) {}
 
@@ -429,6 +431,21 @@ export class ReturnsService {
         creditOffsetAmount: offset,
       },
     });
+
+    // Points earned on the returned value are clawed back proportionally, and
+    // clamped at the balance: taking back points a customer already spent is a
+    // policy decision, not a default (§17.4).
+    if (sale.customerId) {
+      await this.loyalty.reverseForReturn(tx, {
+        organizationId: tenant.organizationId,
+        customerId: sale.customerId,
+        saleId: sale.id,
+        returnId: created.id,
+        refundShare: totalRefund,
+        saleSubtotal: sale.totalAmount,
+        actorId: tenant.userId,
+      });
+    }
 
     // The sale's own totals. The figures that describe what was sold are
     // untouched; only what has since come back moves.

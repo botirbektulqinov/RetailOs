@@ -598,6 +598,7 @@ describe('Returns and exchanges (e2e)', () => {
       // non-cash allocation so the sale reconciles, and is excluded here.
       const payments = await db.payment.findMany({
         where: {
+          organizationId: orgA.organizationId,
           note: { contains: res.body.exchangeNumber as string },
           method: { not: 'OTHER' },
         },
@@ -629,6 +630,7 @@ describe('Returns and exchanges (e2e)', () => {
 
       const payments = await db.payment.findMany({
         where: {
+          organizationId: orgA.organizationId,
           note: { contains: res.body.exchangeNumber as string },
           method: { not: 'OTHER' },
         },
@@ -662,6 +664,7 @@ describe('Returns and exchanges (e2e)', () => {
       // sale — but no money crossed the counter.
       const cash = await db.payment.count({
         where: {
+          organizationId: orgA.organizationId,
           note: { contains: res.body.exchangeNumber as string },
           method: { not: 'OTHER' },
         },

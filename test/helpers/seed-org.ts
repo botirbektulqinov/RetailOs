@@ -220,6 +220,16 @@ export async function dropTestOrg(db: PrismaClient, organizationId: string): Pro
   } finally {
     await db.$executeRaw`ALTER TABLE payment_allocation ENABLE TRIGGER tg_payment_allocation_immutable`;
   }
+  // Loyalty before customers: the ledger is append-only for the application,
+  // like every other record of something that moved.
+  await db.$executeRaw`ALTER TABLE loyalty_transaction DISABLE TRIGGER tg_loyalty_transaction_immutable`;
+  try {
+    await db.loyaltyTransaction.deleteMany({ where: { organizationId } });
+  } finally {
+    await db.$executeRaw`ALTER TABLE loyalty_transaction ENABLE TRIGGER tg_loyalty_transaction_immutable`;
+  }
+  await db.loyaltyAccount.deleteMany({ where: { organizationId } });
+
   // Returns and exchanges before sales: return lines reference sale lines,
   // and an exchange references both the return and the replacement sale.
   await db.exchange.updateMany({ where: { organizationId }, data: {} });
@@ -240,6 +250,7 @@ export async function dropTestOrg(db: PrismaClient, organizationId: string): Pro
   }
   await db.customer.deleteMany({ where: { organizationId } });
   await db.customerGroup.deleteMany({ where: { organizationId } });
+  await db.promotion.deleteMany({ where: { organizationId } });
   await db.idempotencyRecord.deleteMany({ where: { organizationId } });
 
   // Inventory before catalog: levels and movements reference variants and

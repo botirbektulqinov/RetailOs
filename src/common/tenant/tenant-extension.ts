@@ -54,6 +54,9 @@ const TENANT_MODELS = new Set<string>([
   'SaleReturn',
   'ReturnItem',
   'Exchange',
+  'Promotion',
+  'LoyaltyAccount',
+  'LoyaltyTransaction',
 ]);
 
 /** Operations whose `where` must be narrowed to the tenant. */

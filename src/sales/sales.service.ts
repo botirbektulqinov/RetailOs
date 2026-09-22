@@ -6,16 +6,17 @@ import { nextDocumentNumber } from '../common/document-number';
 import { BusinessRuleException } from '../common/exceptions/business-rule.exception';
 import { ErrorCode } from '../common/exceptions/error-codes';
 import { IdempotencyService } from '../common/idempotency/idempotency.service';
+import { priceTimesQuantity } from '../common/money/money';
 import { formatQuantity, parseQuantity, toNumber } from '../common/quantity';
 import type { TenantContext } from '../common/tenant/tenant-context';
 import { PrismaService } from '../database/prisma.service';
 import type { Tx } from '../database/prisma.service';
 import { InventoryService } from '../inventory/inventory.service';
+import { LoyaltyService } from '../loyalty/loyalty.service';
+import { PromotionsService } from '../loyalty/promotions.service';
 import type { CancelSaleDto, CheckoutDto, ListSalesDto } from './dto/sale.dto';
 import { priceSale } from './pricing';
-
-/** LOYALTY tender is recorded but not yet earned or spent — Sprint 9. */
-const UNSUPPORTED_METHODS = new Set(['LOYALTY']);
+import { bestItemDiscount, bestOrderDiscount, groupDiscount } from './promotions';
 
 const SORTABLE: Record<string, Prisma.SaleOrderByWithRelationInput> = {
   'completedAt:desc': { completedAt: 'desc' },
@@ -41,6 +42,8 @@ export class SalesService {
     private readonly prisma: PrismaService,
     private readonly inventory: InventoryService,
     private readonly idempotency: IdempotencyService,
+    private readonly promotions: PromotionsService,
+    private readonly loyalty: LoyaltyService,
     private readonly audit: AuditService,
   ) {}
 
@@ -115,18 +118,23 @@ export class SalesService {
       throw new BusinessRuleException({ code: ErrorCode.EMPTY_SALE, detail: "Savdo bo'sh." });
     }
 
-    for (const payment of dto.payments) {
-      if (UNSUPPORTED_METHODS.has(payment.method)) {
-        throw new BusinessRuleException({
-          code: ErrorCode.VALIDATION_FAILED,
-          status: HttpStatus.UNPROCESSABLE_ENTITY,
-          detail: "LOYALTY to'lovi hali qo'llab-quvvatlanmaydi (Sprint 9).",
-        });
-      }
-    }
-
     const warehouse = await this.resolveWarehouse(dto.warehouseId, tenant.storeId);
     const customer = dto.customerId ? await this.requireCustomer(dto.customerId) : null;
+
+    // A LOYALTY tender is a redemption, and a redemption needs an account to
+    // redeem from (§17.3). It is a payment, not a discount: a discount reduces
+    // revenue, while a redemption settles revenue with a liability the store
+    // recognised when the points were earned.
+    const loyaltyTender = dto.payments
+      .filter((p) => p.method === 'LOYALTY')
+      .reduce((sum, p) => sum + BigInt(p.amount), 0n);
+    if (loyaltyTender > 0n && !dto.customerId) {
+      throw new BusinessRuleException({
+        code: ErrorCode.CREDIT_WITHOUT_CUSTOMER,
+        status: HttpStatus.UNPROCESSABLE_ENTITY,
+        detail: "Ball bilan to'lash uchun mijoz ko'rsatilishi shart.",
+      });
+    }
 
     const creditAmount = BigInt(dto.creditAmount ?? 0);
     if (creditAmount > 0n && !customer) {
@@ -189,7 +197,7 @@ export class SalesService {
         sku: true,
         name: true,
         sellingPrice: true,
-        product: { select: { name: true } },
+        product: { select: { id: true, name: true, categoryId: true } },
       },
     });
     const catalogue = new Map(priced.map((v) => [v.id, v]));
@@ -202,8 +210,20 @@ export class SalesService {
 
     const settings = await this.prisma.db.organizationSettings.findFirst({
       where: { organizationId: tenant.organizationId },
-      select: { cashRoundingUnit: true, defaultDebtTermDays: true },
+      select: {
+        cashRoundingUnit: true,
+        defaultDebtTermDays: true,
+        loyaltyEarnPercent: true,
+        loyaltyPointValue: true,
+      },
     });
+
+    // Promotions, from one snapshot taken for this checkout. The rules are
+    // read here; deciding which one wins is the pure code in
+    // sales/promotions.ts, so every pricing decision is testable on its own.
+    const now = new Date();
+    const rules = await this.promotions.activeRules(now);
+    const promotionContext = { customerGroupId: customer?.customerGroupId ?? null, at: now };
 
     const lines = dto.items.map((item, index) => {
       const variant = catalogue.get(item.variantId)!;
@@ -216,6 +236,16 @@ export class SalesService {
         });
       }
 
+      const unitPrice =
+        item.unitPrice !== undefined ? BigInt(item.unitPrice) : variant.sellingPrice;
+      const gross = priceTimesQuantity(unitPrice, BigInt(Math.round(quantity * 1000)));
+
+      const promotion = bestItemDiscount(
+        rules,
+        { productId: variant.product.id, categoryId: variant.product.categoryId, gross },
+        promotionContext,
+      );
+
       return {
         variantId: item.variantId,
         // The receipt's own words, frozen. A product renamed next month must
@@ -225,11 +255,39 @@ export class SalesService {
           : variant.product.name,
         skuSnapshot: variant.sku,
         quantity: formatQuantity(quantity),
-        unitPrice: item.unitPrice !== undefined ? BigInt(item.unitPrice) : variant.sellingPrice,
+        unitPrice,
+        gross,
         unitCost: costByVariant.get(item.variantId) ?? 0n,
         lineDiscount: BigInt(item.discountAmount ?? 0),
+        promotionDiscount: promotion?.amount ?? 0n,
+        ...(promotion ? { promotionId: promotion.promotionId } : {}),
       };
     });
+
+    // The order-level candidates share one base: the subtotal after line
+    // discounts, which is what the customer is actually about to spend.
+    const subtotalAfterLines = lines.reduce((sum, l) => {
+      const applied = l.lineDiscount >= l.promotionDiscount ? l.lineDiscount : l.promotionDiscount;
+      return sum + l.gross - (applied > l.gross ? l.gross : applied);
+    }, 0n);
+
+    const orderPromotion = bestOrderDiscount(rules, subtotalAfterLines, promotionContext);
+    const group = customer?.group
+      ? groupDiscount(
+          BigInt(Math.round(Number(customer.group.discountPercent.toString()) * 100)),
+          subtotalAfterLines,
+          customer.group.name,
+        )
+      : null;
+
+    // One winner between the campaign and the standing group percentage: a VIP
+    // who also catches a promotion gets the better of the two, not both.
+    const orderCandidate =
+      orderPromotion && group
+        ? orderPromotion.amount >= group.amount
+          ? orderPromotion
+          : group
+        : (orderPromotion ?? group);
 
     const tenderIsAllCash =
       dto.payments.length > 0 && dto.payments.every((p) => p.method === 'CASH');
@@ -237,6 +295,8 @@ export class SalesService {
     const pricing = priceSale({
       lines,
       orderDiscount: BigInt(dto.orderDiscountAmount ?? 0),
+      orderPromotionDiscount: orderCandidate?.amount ?? 0n,
+      orderPromotionId: orderCandidate?.promotionId || null,
       cashRoundingUnit: settings?.cashRoundingUnit ?? 0n,
       // Rounding a mixed tender would mean rounding a card amount the terminal
       // never saw, so credit counts against "all cash" too.
@@ -278,6 +338,9 @@ export class SalesService {
       paidAmount,
       creditAmount,
       variants,
+      earnPercent: BigInt(Math.round(Number((settings?.loyaltyEarnPercent ?? 0).toString()) * 100)),
+      pointValue: settings?.loyaltyPointValue ?? 1n,
+      loyaltyTender,
       dueDate: this.resolveDueDate(dto.dueDate, settings?.defaultDebtTermDays ?? 30),
     };
   }
@@ -318,6 +381,7 @@ export class SalesService {
         paidAmount,
         creditAmount,
         costAmount: pricing.costAmount,
+        promotionId: pricing.orderPromotionId,
         discountReason: dto.discountReason ?? null,
         note: dto.note ?? null,
         createdBy: tenant.userId,
@@ -338,6 +402,7 @@ export class SalesService {
               allocatedOrderDiscount: line.allocatedOrderDiscount,
               netAmount: line.netAmount,
               unitCost: line.unitCost,
+              promotionId: line.promotionId,
               position: line.position,
             })),
           },
@@ -391,6 +456,41 @@ export class SalesService {
           saleId: sale.id,
           amount: BigInt(payment.amount),
         },
+      });
+    }
+
+    // Redemption — §17.3. The payment row above already records the tender;
+    // this moves the points, under a guard that cannot take the balance below
+    // zero. Two tills redeeming the same points cannot both succeed.
+    if (context.loyaltyTender > 0n && customer) {
+      const pointValue = context.pointValue > 0n ? context.pointValue : 1n;
+      if (context.loyaltyTender % pointValue !== 0n) {
+        throw new BusinessRuleException({
+          code: ErrorCode.VALIDATION_FAILED,
+          status: HttpStatus.UNPROCESSABLE_ENTITY,
+          detail: `Ball summasi ${pointValue} ga bo'linishi kerak.`,
+        });
+      }
+      await this.loyalty.redeem(tx, {
+        organizationId: tenant.organizationId,
+        customerId: customer.id,
+        points: context.loyaltyTender / pointValue,
+        pointValue,
+        actorId: tenant.userId,
+      });
+    }
+
+    // Earning — on subtotal_amount, the net of discounts, so cash rounding
+    // does not leak into loyalty and a discounted sale does not also generate
+    // full points (§17.2).
+    if (customer) {
+      await this.loyalty.earn(tx, {
+        organizationId: tenant.organizationId,
+        customerId: customer.id,
+        saleId: sale.id,
+        subtotal: pricing.subtotalAmount - pricing.orderDiscountAmount,
+        earnPercent: context.earnPercent,
+        actorId: tenant.userId,
       });
     }
 
@@ -754,6 +854,7 @@ export class SalesService {
             netAmount: true,
             unitCost: true,
             returnedQuantity: true,
+            promotionId: true,
             position: true,
           },
           orderBy: { position: 'asc' },
@@ -844,7 +945,13 @@ export class SalesService {
   private async requireCustomer(customerId: string) {
     const customer = await this.prisma.db.customer.findFirst({
       where: { id: customerId, archivedAt: null },
-      select: { id: true, fullName: true, creditLimit: true },
+      select: {
+        id: true,
+        fullName: true,
+        creditLimit: true,
+        customerGroupId: true,
+        group: { select: { name: true, discountPercent: true, creditLimit: true } },
+      },
     });
     if (!customer) throw BusinessRuleException.notFound('Mijoz', customerId);
     return customer;
@@ -859,10 +966,18 @@ export class SalesService {
    * regulars.
    */
   private async assertWithinCreditLimit(
-    customer: { id: string; fullName: string; creditLimit: bigint | null },
+    customer: {
+      id: string;
+      fullName: string;
+      creditLimit: bigint | null;
+      group?: { creditLimit: bigint | null } | null;
+    },
     creditAmount: bigint,
   ) {
-    if (customer.creditLimit === null) return;
+    // Resolution order: the customer's own limit, else the group's, else
+    // unlimited — the same order the customer card reports.
+    const limit = customer.creditLimit ?? customer.group?.creditLimit ?? null;
+    if (limit === null) return;
 
     const open = await this.prisma.db.customerReceivable.aggregate({
       where: { customerId: customer.id, status: { in: ['OPEN', 'PARTIALLY_PAID'] } },
@@ -873,7 +988,7 @@ export class SalesService {
       (open._sum.paidAmount ?? 0n) -
       (open._sum.writtenOffAmount ?? 0n);
 
-    if (outstanding + creditAmount > customer.creditLimit) {
+    if (outstanding + creditAmount > limit) {
       throw new BusinessRuleException({
         code: ErrorCode.CREDIT_LIMIT_EXCEEDED,
         detail: `${customer.fullName} uchun qarz chegarasi oshib ketadi.`,
@@ -882,7 +997,7 @@ export class SalesService {
             code: ErrorCode.CREDIT_LIMIT_EXCEEDED,
             message: customer.fullName,
             meta: {
-              limit: customer.creditLimit.toString(),
+              limit: limit.toString(),
               outstanding: outstanding.toString(),
               requested: creditAmount.toString(),
             },

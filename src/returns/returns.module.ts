@@ -2,6 +2,7 @@ import { Module } from '@nestjs/common';
 
 import { IdempotencyService } from '../common/idempotency/idempotency.service';
 import { InventoryModule } from '../inventory/inventory.module';
+import { LoyaltyModule } from '../loyalty/loyalty.module';
 import { ExchangesController, ReturnsController } from './returns.controller';
 import { ReturnsService } from './returns.service';
 
@@ -15,7 +16,7 @@ import { ReturnsService } from './returns.service';
  * the stock guard, the document counter — is the same code path either way.
  */
 @Module({
-  imports: [InventoryModule],
+  imports: [InventoryModule, LoyaltyModule],
   controllers: [ReturnsController, ExchangesController],
   providers: [ReturnsService, IdempotencyService],
   exports: [ReturnsService],
