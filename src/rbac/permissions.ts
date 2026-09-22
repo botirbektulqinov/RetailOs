@@ -198,6 +198,23 @@ export function hasPermission(granted: ReadonlySet<string>, required: string): b
 }
 
 /**
+ * Does this caller hold every permission in the system?
+ *
+ * The question store scoping actually asks: an owner is organization-wide and
+ * implicitly a member of every store, everybody else is not.
+ *
+ * It cannot be `granted.has('*')`, because by the time a permission set
+ * reaches a service it has been through expandPermissions() — which replaces
+ * the wildcard with the concrete keys and so never contains `*`. The set is
+ * built only from ALL_PERMISSIONS, so holding all of them is the same
+ * statement, and it stays true for a custom role that was granted everything
+ * rather than the literal star.
+ */
+export function isOrgWide(granted: ReadonlySet<string>): boolean {
+  return granted.has(WILDCARD) || granted.size === ALL_PERMISSIONS.length;
+}
+
+/**
  * Expands wildcards into concrete permission keys, for the /auth/me response.
  * A client cannot render a permission-driven UI from the literal string `*`.
  */

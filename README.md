@@ -245,6 +245,8 @@ src/
   cash/                    registers, shifts, drawer movements, the Z-report
   employees/               employee CRUD
     assignments.service.ts store assignments, account actions, store scope
+  reports/                 the twelve reports and the dashboard
+    reports.repository.ts  every report query, as reviewed SQL — the only raw-SQL module
   audit/                   the append-only audit trail
   common/
     money/                 Money primitives: bigint minor units (§8)
@@ -265,13 +267,13 @@ prisma/
 test/
   setup-e2e.ts             raises the auth throttle before anything imports
   foundation · auth · catalog · inventory · sales · customers
-  procurement · returns · loyalty · cash                 .e2e-spec.ts
+  procurement · returns · loyalty · cash · reports       .e2e-spec.ts
   helpers/seed-org.ts      two complete look-alike organizations, for isolation probes
 docs/
   ARCHITECTURE.md          the source of truth
 ```
 
-Remaining feature modules (`cash/`, `reports/`, `notifications/`) are **not**
+Remaining feature modules (`notifications/`) are **not**
 scaffolded as empty folders. They are created by the sprint that implements
 them — see *§30* for the planned layout and the module boundary rules.
 
@@ -1983,6 +1985,163 @@ curl -s -X POST "$API/shifts/$SHIFT/close" -H "Authorization: Bearer $TOKEN" \
 
 ---
 
+## Reporting and the dashboard
+
+Twelve reports and one dashboard, all answered by **PostgreSQL aggregation**.
+No ClickHouse, no warehouse, no ETL: a small shop produces a few hundred sales
+a day, and every question here is a handful of index scans against indexes the
+transactional paths already need.
+
+| Report | `GET /reports/…` | Answers |
+|---|---|---|
+| Sales | `sales` | revenue, margin, daily trend, per-cashier |
+| Products | `products` | best sellers and dead stock, net of returns |
+| Employees | `employees` | who sold what, and who discounted it |
+| Payments | `payments` | the tender breakdown, both directions |
+| Debt | `debt` | receivables with aging buckets and the worst debtors |
+| Cash | `cash` | every shift's expected, counted and difference |
+| Inventory | `inventory` | valuation, movement volume, the re-order list |
+| Suppliers | `suppliers` | spend and what is still payable |
+| Returns | `returns` | the return rate and the reasons behind it |
+| Customers | `customers` | who spends, and what they still owe |
+| Dashboard | `GET /dashboard` | all of today's headline numbers in one request |
+| Export | `reports/export` | any of six of them as CSV |
+
+Every endpoint takes the **same filter** — `from`, `to`, `storeId`,
+`warehouseId`, `employeeId`, `customerId`, `categoryId`, `productId`,
+`paymentMethod`, `limit` — so a client builds the query string once. Omit the
+dates and you get the last 30 days, because an unbounded report is the one that
+takes the database down. `limit` is capped at 500.
+
+### Two rules every query follows
+
+**1. Aggregate in the database.** Nothing loads rows in order to count them.
+The dashboard is eight statements issued in parallel, not eight round trips and
+a reduce; a year of sales is an index scan, not a hundred thousand objects in
+Node's heap.
+
+**2. Every `SUM()` over a `BIGINT` ends `::bigint`.** PostgreSQL widens it to
+`NUMERIC`, which the driver hands back as a **string** — and `200000n + "0"` is
+not `200000n`, it is the string `"2000000"`. Sprint 10 shipped that bug once
+and every drawer figure was ten times too large per term. It is not shipping
+again, which is why the rule is written at the top of the repository file.
+
+### Reads are separated from writes
+
+`ReportsRepository` reaches the database through one private accessor:
+
+```ts
+private get read() {
+  return this.prisma.db;
+}
+```
+
+Today that is the same connection. Pointing reports at a **read replica** is
+then a change to one line rather than a refactor of seventeen queries.
+
+Reports are **raw SQL, not the ORM**. Prisma's query builder is excellent for
+row access and poor at analytical SQL, and a report is the one place where
+seeing the query matters more than inferring the result type.
+
+### Business date, not UTC date
+
+```sql
+(s.completed_at AT TIME ZONE COALESCE(st.timezone, o.timezone, 'Asia/Tashkent'))::date
+```
+
+A sale rung at 00:30 belongs to the evening that produced it. Grouping on the
+UTC date makes every daily figure disagree with the cashier's own count, which
+destroys trust in the reports faster than any bug could.
+
+### What is deliberately **not** here
+
+**No materialized view.** *§28.3* proposes `mv_daily_sales_summary` for the
+12-month trend. At MVP scale that query is a few thousand rows against an index
+that already exists, and **a view nothing refreshes is worse than no view** —
+it is wrong silently. Add it when a real dataset makes the query slow, along
+with the job that refreshes it.
+
+**No export job table and no worker.** *§28.4* proposes `export_job` plus a
+download-link flow for anything over 5,000 rows. Every report here is capped at
+500 by the filter, so that machinery would serve a case that cannot currently
+occur. CSV is generated inline; `ReportsService.exportCsv` is the single
+boundary where that changes.
+
+Values are quoted per RFC 4180. A product called `Choy, 250 g` is not exotic,
+and an unquoted comma silently shifts every later column.
+
+### Authorization — permission says *what*, not *whose*
+
+This is the only module whose SQL bypasses the Prisma tenant extension, so both
+scopes are applied by hand in `ReportsService.resolve()`:
+
+- **Tenant** — the organization comes from the verified token and never from
+  the query. Every one of the seventeen statements names it.
+- **Store** (*§20.4* layer 3) — an explicit `storeId` is checked against the
+  caller's memberships; without one, a manager gets the branches they work in
+  rather than the organization.
+
+| Action | Permission | Who has it |
+|---|---|---|
+| Read any report or the dashboard | `reports.read` | cashier, manager |
+| Download CSV | `reports.export` | manager |
+
+Reading a figure on screen and extracting the dataset are different acts, which
+is why they are different permissions.
+
+> **The wildcard is not a string you can test for.** `expandPermissions()`
+> replaces `*` with the concrete keys before the set ever reaches a service, so
+> `permissions.has('*')` is **always false**. `isOrgWide()` asks the question
+> that actually holds — does this caller hold every permission in the system —
+> and it is what store scoping uses. The two wildcard shortcuts in
+> `AssignmentsService` were written the other way and were dead code until the
+> reporting work tripped over them.
+
+Stock reports are **not** store-scoped: a warehouse may be organization-level
+(`warehouse.store_id IS NULL`), and hiding the central warehouse from every
+branch manager is the opposite of useful. `warehouseId` is that filter.
+
+### The reconciliation suite
+
+A report suite that asserts against fixtures proves only that the fixture and
+the assertion were written by the same person. Every number in
+`test/reports.e2e-spec.ts` is checked against the rows it claims to summarise:
+
+| The report says | Checked against |
+|---|---|
+| sales gross, count, cost | `SUM()` over the `sale` ledger |
+| refunds | `SUM()` over `sale_return` |
+| payments taken / refunded | `payment` rows, per direction |
+| debt outstanding | open `customer_receivable` rows |
+| aging buckets | must add back up to outstanding |
+| cash net difference | the **stored** `difference_amount` per shift |
+| stock value | `inventory_level.quantity × avg_cost` |
+| movement volume | the `inventory_movement` ledger — and *§9.7*, the level equals its own movements |
+| supplier payable | `purchase.total − paid` |
+| dashboard | the sales report for the same business day |
+
+A movement inserted **after** a shift closes does not move the closed figure —
+what the cashier signed for stays signed for. A cancelled sale keeps its own
+numbers and simply stops being counted.
+
+```bash
+# Today, everything
+curl -s "$API/dashboard" -H "Authorization: Bearer $TOKEN"
+
+# One branch, one week
+curl -s "$API/reports/sales?from=2026-09-15T00:00:00Z&storeId=$STORE" \
+  -H "Authorization: Bearer $TOKEN"
+
+# What to re-order
+curl -s "$API/reports/inventory?limit=100" -H "Authorization: Bearer $TOKEN"
+
+# The best sellers, as a spreadsheet
+curl -s "$API/reports/export?report=top-products&limit=50" \
+  -H "Authorization: Bearer $TOKEN" -o top-products.csv
+```
+
+---
+
 ## Foundation behaviour worth knowing
 
 **API versioning.** URI-based: every route lives under `/api/v1/...`. The
@@ -2057,7 +2216,7 @@ Sprint 1 is the foundation. Phases follow *§33 Implementation order*:
 | **8 ✅** | Returns & exchanges: quantity guard, net refunds, debt offset, net settlement | a line can never be over-returned, and a partial return strands no soʻm |
 | **9 ✅** | Discounts, promotions and loyalty: one winner per level, points as a tender | a balance always equals its own ledger, and promotions never stack |
 | **10 ✅** | Cash register, shifts, employee administration, store-aware RBAC | the drawer always equals its own payments and movements |
-| 11 | Reporting and dashboard metrics |
+| **11 ✅** | Reporting and dashboard metrics: twelve reports, one dashboard, CSV export | every report total equals the ledger it summarises |
 | 12 | Notifications, Telegram, audit search |
 
 ---

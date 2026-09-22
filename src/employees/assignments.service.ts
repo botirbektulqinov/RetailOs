@@ -6,6 +6,7 @@ import { BusinessRuleException } from '../common/exceptions/business-rule.except
 import { ErrorCode } from '../common/exceptions/error-codes';
 import type { TenantContext } from '../common/tenant/tenant-context';
 import { PrismaService } from '../database/prisma.service';
+import { isOrgWide } from '../rbac/permissions';
 import type { AssignStoreDto, ResetPasswordDto } from './dto/employee.dto';
 
 /**
@@ -42,7 +43,7 @@ export class AssignmentsService {
    * exactly their memberships.
    */
   async storesFor(tenant: TenantContext): Promise<string[]> {
-    if (tenant.permissions.has('*')) {
+    if (isOrgWide(tenant.permissions)) {
       const stores = await this.prisma.db.store.findMany({
         where: { archivedAt: null },
         select: { id: true },
@@ -65,7 +66,7 @@ export class AssignmentsService {
    */
   async assertStoreAccess(tenant: TenantContext, storeId: string): Promise<void> {
     if (tenant.storeId === storeId) return;
-    if (tenant.permissions.has('*')) return;
+    if (isOrgWide(tenant.permissions)) return;
 
     const membership = await this.prisma.db.storeMembership.findFirst({
       where: { userId: tenant.userId, storeId, status: 'ACTIVE' },
