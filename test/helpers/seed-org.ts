@@ -220,6 +220,15 @@ export async function dropTestOrg(db: PrismaClient, organizationId: string): Pro
   } finally {
     await db.$executeRaw`ALTER TABLE payment_allocation ENABLE TRIGGER tg_payment_allocation_immutable`;
   }
+  // Cash before sales: sales and payments point at the shift they were rung
+  // on, and cash_movement is append-only for the application.
+  await db.$executeRaw`ALTER TABLE cash_movement DISABLE TRIGGER tg_cash_movement_immutable`;
+  try {
+    await db.cashMovement.deleteMany({ where: { organizationId } });
+  } finally {
+    await db.$executeRaw`ALTER TABLE cash_movement ENABLE TRIGGER tg_cash_movement_immutable`;
+  }
+
   // Loyalty before customers: the ledger is append-only for the application,
   // like every other record of something that moved.
   await db.$executeRaw`ALTER TABLE loyalty_transaction DISABLE TRIGGER tg_loyalty_transaction_immutable`;
@@ -269,6 +278,9 @@ export async function dropTestOrg(db: PrismaClient, organizationId: string): Pro
   } finally {
     await db.$executeRaw`ALTER TABLE inventory_movement ENABLE TRIGGER tg_inventory_movement_immutable`;
   }
+
+  await db.cashRegisterShift.deleteMany({ where: { organizationId } });
+  await db.cashRegister.deleteMany({ where: { organizationId } });
 
   await db.documentCounter.deleteMany({ where: { organizationId } });
 

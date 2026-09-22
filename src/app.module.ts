@@ -6,6 +6,7 @@ import { LoggerModule } from 'nestjs-pino';
 
 import { AuditModule } from './audit/audit.module';
 import { AuthModule } from './auth/auth.module';
+import { CashModule } from './cash/cash.module';
 import { CatalogModule } from './catalog/catalog.module';
 import { JwtAuthGuard } from './auth/guards/jwt-auth.guard';
 import { PermissionsGuard } from './auth/guards/permissions.guard';
@@ -68,6 +69,7 @@ import { StoresModule } from './stores/stores.module';
     ProcurementModule,
     ReturnsModule,
     LoyaltyModule,
+    CashModule,
     HealthModule,
   ],
   providers: [

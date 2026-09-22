@@ -2,6 +2,7 @@ import { HttpStatus, Injectable } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 
 import { AuditService } from '../audit/audit.service';
+import { CashService } from '../cash/cash.service';
 import { BusinessRuleException } from '../common/exceptions/business-rule.exception';
 import { ErrorCode } from '../common/exceptions/error-codes';
 import { IdempotencyService } from '../common/idempotency/idempotency.service';
@@ -53,6 +54,7 @@ export class SuppliersService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly idempotency: IdempotencyService,
+    private readonly cash: CashService,
     private readonly audit: AuditService,
   ) {}
 
@@ -484,6 +486,10 @@ export class SuppliersService {
         storeId: tenant.storeId,
         supplierId,
         purchaseId: dto.purchaseId ?? null,
+        // Only a CASH payment touches a drawer; the column is null for a bank
+        // transfer, which is why the expected-cash query filters on method.
+        cashRegisterShiftId:
+          dto.method === 'CASH' ? await this.cash.openShiftIdFor(tx, tenant.storeId) : null,
         method: dto.method,
         amount,
         reference: dto.reference ?? null,

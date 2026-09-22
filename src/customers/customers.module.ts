@@ -1,5 +1,6 @@
 import { Module } from '@nestjs/common';
 
+import { CashModule } from '../cash/cash.module';
 import { IdempotencyService } from '../common/idempotency/idempotency.service';
 import {
   CustomerGroupsController,
@@ -21,6 +22,7 @@ import { DebtsService } from './debts.service';
  * ever reads sales.
  */
 @Module({
+  imports: [CashModule],
   controllers: [CustomersController, CustomerGroupsController, DebtsController],
   providers: [CustomersService, DebtsService, IdempotencyService],
   exports: [CustomersService, DebtsService],

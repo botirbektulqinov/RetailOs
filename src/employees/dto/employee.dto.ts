@@ -1,5 +1,6 @@
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import {
+  IsBoolean,
   IsEmail,
   IsEnum,
   IsOptional,
@@ -84,4 +85,35 @@ export class UpdateEmployeeDto {
   @IsOptional()
   @IsUUID()
   roleId?: string;
+}
+
+export class AssignStoreDto {
+  @ApiProperty()
+  @IsUUID()
+  storeId!: string;
+
+  @ApiProperty({
+    description: "Shu do'kondagi rol. Ayni odam boshqa filialda boshqa rolda bo'lishi mumkin.",
+  })
+  @IsUUID()
+  roleId!: string;
+
+  @ApiPropertyOptional({
+    description: "Yangi sessiya qaysi do'konga tushadi. Faqat bittasi asosiy bo'la oladi.",
+  })
+  @IsOptional()
+  @IsBoolean()
+  isPrimary?: boolean;
+}
+
+export class ResetPasswordDto {
+  @ApiProperty({
+    description:
+      "Administrator yangi parolni o'zi beradi va xodimga tizimdan tashqari yetkazadi. " +
+      'Javobda ham, auditda ham parol qaytarilmaydi.',
+  })
+  @IsString()
+  @MinLength(PASSWORD_MIN_LENGTH)
+  @MaxLength(PASSWORD_MAX_LENGTH)
+  newPassword!: string;
 }

@@ -1,6 +1,7 @@
 import { Module } from '@nestjs/common';
 
 import { IdempotencyService } from '../common/idempotency/idempotency.service';
+import { CashModule } from '../cash/cash.module';
 import { InventoryModule } from '../inventory/inventory.module';
 import { LoyaltyModule } from '../loyalty/loyalty.module';
 import { SalesController } from './sales.controller';
@@ -19,7 +20,7 @@ import { SalesService } from './sales.service';
  * owns the customer domain.
  */
 @Module({
-  imports: [InventoryModule, LoyaltyModule],
+  imports: [InventoryModule, LoyaltyModule, CashModule],
   controllers: [SalesController],
   providers: [SalesService, IdempotencyService],
   exports: [SalesService, IdempotencyService],

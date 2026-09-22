@@ -1,5 +1,6 @@
 import { Module } from '@nestjs/common';
 
+import { CashModule } from '../cash/cash.module';
 import { IdempotencyService } from '../common/idempotency/idempotency.service';
 import { InventoryModule } from '../inventory/inventory.module';
 import { PurchasesController, SuppliersController } from './procurement.controller';
@@ -14,7 +15,7 @@ import { SuppliersService } from './suppliers.service';
  * wrote a level directly would be invisible to the reconciliation query.
  */
 @Module({
-  imports: [InventoryModule],
+  imports: [InventoryModule, CashModule],
   controllers: [SuppliersController, PurchasesController],
   providers: [SuppliersService, PurchasesService, IdempotencyService],
   exports: [SuppliersService, PurchasesService],

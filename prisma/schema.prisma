@@ -122,11 +122,12 @@ model Store {
   createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
   updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
 
-  organization Organization      @relation(fields: [organizationId], references: [id])
-  warehouses   Warehouse[]
-  memberships  StoreMembership[]
-  sales        Sale[]
-  purchases    Purchase[]
+  organization  Organization      @relation(fields: [organizationId], references: [id])
+  warehouses    Warehouse[]
+  memberships   StoreMembership[]
+  sales         Sale[]
+  purchases     Purchase[]
+  cashRegisters CashRegister[]
 
   // Every tenant model carries this compound unique so a scoped lookup can
   // never be written as a bare findUnique({ where: { id } }) — see §4.3.
@@ -962,6 +963,11 @@ model Sale {
 
   customerId String? @map("customer_id") @db.Uuid
 
+  /// The shift this was rung on, when the store runs shifts. Nullable: a shop
+  /// that does not open a till still sells, and the Z-report is then simply
+  /// about the shifts that did happen.
+  cashRegisterShiftId String? @map("cash_register_shift_id") @db.Uuid
+
   /// Human receipt number, unique per store.
   saleNumber String @map("sale_number")
 
@@ -1018,6 +1024,7 @@ model Sale {
   receivable            CustomerReceivable?
   returns               SaleReturn[]
   exchangeAsReplacement Exchange?           @relation("ExchangeSale")
+  cashRegisterShift     CashRegisterShift?  @relation(fields: [cashRegisterShiftId], references: [id])
 
   @@unique([organizationId, id])
   @@unique([organizationId, storeId, saleNumber])
@@ -1080,6 +1087,10 @@ model Payment {
   storeId        String  @map("store_id") @db.Uuid
   customerId     String? @map("customer_id") @db.Uuid
 
+  /// Every tender taken on a shift, whatever the method — a Z-report needs the
+  /// card total as much as the cash one.
+  cashRegisterShiftId String? @map("cash_register_shift_id") @db.Uuid
+
   direction PaymentDirection
   method    PaymentMethod
 
@@ -1103,10 +1114,12 @@ model Payment {
   updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
 
   customer    Customer?           @relation(fields: [customerId], references: [id])
+  shift       CashRegisterShift?  @relation(fields: [cashRegisterShiftId], references: [id])
   allocations PaymentAllocation[]
 
   @@unique([organizationId, id])
   @@index([organizationId, customerId, createdAt(sort: Desc)])
+  @@index([cashRegisterShiftId, method])
   @@index([organizationId, storeId, createdAt(sort: Desc)])
   @@index([organizationId, method, createdAt(sort: Desc)])
   @@map("payment")
@@ -1352,6 +1365,10 @@ model SupplierPayment {
   /// null = paid on account rather than against one invoice.
   purchaseId String? @map("purchase_id") @db.Uuid
 
+  /// Set when the supplier was paid in cash out of a till, which takes money
+  /// out of that shift's drawer.
+  cashRegisterShiftId String? @map("cash_register_shift_id") @db.Uuid
+
   method PaymentMethod
   amount BigInt
 
@@ -1365,8 +1382,9 @@ model SupplierPayment {
 
   createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
 
-  supplier Supplier  @relation(fields: [supplierId], references: [id])
-  purchase Purchase? @relation(fields: [purchaseId], references: [id])
+  supplier Supplier           @relation(fields: [supplierId], references: [id])
+  purchase Purchase?          @relation(fields: [purchaseId], references: [id])
+  shift    CashRegisterShift? @relation(fields: [cashRegisterShiftId], references: [id])
 
   @@unique([organizationId, id])
   @@index([organizationId, supplierId, paidAt(sort: Desc)])
@@ -1659,4 +1677,130 @@ model LoyaltyTransaction {
   @@index([loyaltyAccountId, createdAt(sort: Desc)])
   @@index([organizationId, saleId])
   @@map("loyalty_transaction")
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Cash register (Sprint 10)
+// ──────────────────────────────────────────────────────────────────────────
+
+enum ShiftStatus {
+  OPEN
+  CLOSED
+}
+
+enum CashMovementDirection {
+  IN
+  OUT
+}
+
+/// Manual drawer movements only. A sale, a refund and a debt collection all
+/// affect the drawer too, but they are `payment` rows — recording them here as
+/// well would double-count every soʻm.
+enum CashMovementType {
+  DROP
+  PAYOUT
+  EXPENSE
+  CORRECTION
+  OTHER
+}
+
+/// The physical till. A store may have several.
+model CashRegister {
+  id             String @id @default(uuid()) @db.Uuid
+  organizationId String @map("organization_id") @db.Uuid
+  storeId        String @map("store_id") @db.Uuid
+
+  code String
+  name String
+
+  status     EntityStatus @default(ACTIVE)
+  archivedAt DateTime?    @map("archived_at") @db.Timestamptz(6)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  store  Store               @relation(fields: [storeId], references: [id])
+  shifts CashRegisterShift[]
+
+  @@unique([organizationId, id])
+  @@index([organizationId, storeId])
+  @@map("cash_register")
+}
+
+/// One open shift per register at a time, enforced by a partial unique index —
+/// two cashiers cannot open the same till, and the database says so rather
+/// than a service method with a race in it.
+model CashRegisterShift {
+  id             String @id @default(uuid()) @db.Uuid
+  organizationId String @map("organization_id") @db.Uuid
+  storeId        String @map("store_id") @db.Uuid
+  cashRegisterId String @map("cash_register_id") @db.Uuid
+
+  shiftNumber String      @map("shift_number")
+  status      ShiftStatus @default(OPEN)
+
+  /// The float the cashier started with.
+  openingAmount BigInt   @map("opening_amount")
+  openedBy      String   @map("opened_by") @db.Uuid
+  openedAt      DateTime @default(now()) @map("opened_at") @db.Timestamptz(6)
+
+  /// Computed at close from the shift's own payments and movements (§19.3).
+  /// Stored rather than recomputed: a Z-report reprinted next month must show
+  /// what the cashier was asked to sign for, not what a later correction
+  /// would now produce.
+  expectedCashAmount BigInt? @map("expected_cash_amount")
+
+  /// What was physically in the drawer.
+  countedCashAmount BigInt? @map("counted_cash_amount")
+
+  /// counted − expected. Negative is short, positive is over. Both are kept;
+  /// neither is silently corrected.
+  differenceAmount BigInt? @map("difference_amount")
+
+  closedBy String?   @map("closed_by") @db.Uuid
+  closedAt DateTime? @map("closed_at") @db.Timestamptz(6)
+
+  note String?
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  register         CashRegister      @relation(fields: [cashRegisterId], references: [id])
+  movements        CashMovement[]
+  sales            Sale[]
+  payments         Payment[]
+  supplierPayments SupplierPayment[]
+
+  @@unique([organizationId, id])
+  @@unique([organizationId, shiftNumber])
+  @@index([organizationId, storeId, openedAt(sort: Desc)])
+  @@index([cashRegisterId, status])
+  @@map("cash_register_shift")
+}
+
+/// Append-only, like every other record of money that moved.
+model CashMovement {
+  id                  String @id @default(uuid()) @db.Uuid
+  organizationId      String @map("organization_id") @db.Uuid
+  storeId             String @map("store_id") @db.Uuid
+  cashRegisterShiftId String @map("cash_register_shift_id") @db.Uuid
+
+  direction CashMovementDirection
+  type      CashMovementType
+
+  /// Always positive; `direction` carries the sign.
+  amount BigInt
+
+  /// Mandatory. "Where did that 200,000 go" is the question this table exists
+  /// to answer.
+  reason String
+
+  createdBy String   @map("created_by") @db.Uuid
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  shift CashRegisterShift @relation(fields: [cashRegisterShiftId], references: [id])
+
+  @@unique([organizationId, id])
+  @@index([organizationId, cashRegisterShiftId])
+  @@map("cash_movement")
 }

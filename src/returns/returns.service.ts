@@ -2,6 +2,7 @@ import { HttpStatus, Injectable } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 
 import { AuditService } from '../audit/audit.service';
+import { CashService } from '../cash/cash.service';
 import { nextDocumentNumber } from '../common/document-number';
 import { BusinessRuleException } from '../common/exceptions/business-rule.exception';
 import { ErrorCode } from '../common/exceptions/error-codes';
@@ -55,6 +56,7 @@ export class ReturnsService {
     private readonly prisma: PrismaService,
     private readonly inventory: InventoryService,
     private readonly idempotency: IdempotencyService,
+    private readonly cash: CashService,
     private readonly loyalty: LoyaltyService,
     private readonly audit: AuditService,
   ) {}
@@ -406,6 +408,7 @@ export class ReturnsService {
           organizationId: tenant.organizationId,
           storeId: tenant.storeId,
           customerId: sale.customerId,
+          cashRegisterShiftId: await this.cash.openShiftIdFor(tx, tenant.storeId),
           direction: 'OUT',
           method: (dto.refundMethod ?? 'CASH') as 'CASH',
           amount: cashRefund,

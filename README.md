@@ -242,6 +242,9 @@ src/
   returns/                 returns, refunds and exchanges
   loyalty/                 promotions, the points ledger
     ../sales/promotions.ts the §18.3 resolver, pure and testable
+  cash/                    registers, shifts, drawer movements, the Z-report
+  employees/               employee CRUD
+    assignments.service.ts store assignments, account actions, store scope
   audit/                   the append-only audit trail
   common/
     money/                 Money primitives: bigint minor units (§8)
@@ -261,8 +264,8 @@ prisma/
   seed.ts
 test/
   setup-e2e.ts             raises the auth throttle before anything imports
-  foundation · auth · catalog · inventory · sales
-  customers · procurement · returns · loyalty      .e2e-spec.ts
+  foundation · auth · catalog · inventory · sales · customers
+  procurement · returns · loyalty · cash                 .e2e-spec.ts
   helpers/seed-org.ts      two complete look-alike organizations, for isolation probes
 docs/
   ARCHITECTURE.md          the source of truth
@@ -1770,6 +1773,216 @@ curl -s "$API/loyalty/$CUSTOMER/history" -H "Authorization: Bearer $TOKEN"
 
 ---
 
+## Cash register and shifts
+
+The drawer is **not a stored number**. It is the arithmetic over a shift's own
+payments and movements, computed when asked (*§19.3*):
+
+```
+expected = opening
+         + cash payments IN   − cash payments OUT
+         + cash movements IN  − cash movements OUT
+         − cash supplier payments
+```
+
+The same reasoning as stock, debt and points. The one exception is at close,
+where the figure **is** stored — a Z-report reprinted next month must show what
+the cashier was asked to sign for, not what a later correction would now
+produce. A `CHECK` keeps the stored difference consistent with the two numbers
+it came from.
+
+> **One sum, one cast.** Every aggregate in the drawer query ends `::bigint`.
+> PostgreSQL widens `SUM()` over a `BIGINT` column to `NUMERIC`, which the
+> driver returns as a **string**, and `200000n + "0"` is not `200000n` — it is
+> the string `"2000000"`. Without the cast every drawer figure is silently
+> wrong by a factor of ten per term. The first run of the suite reported
+> exactly that.
+
+### One open shift per register
+
+```sql
+CREATE UNIQUE INDEX uq_one_open_shift_per_register
+  ON cash_register_shift (cash_register_id) WHERE status = 'OPEN';
+```
+
+Two cashiers tapping "open" at the same moment both pass any application-level
+check; only the index stops the second. A test fires both in parallel and
+asserts exactly one wins.
+
+### What moves the drawer
+
+| Event | Drawer | On the Z-report |
+|---|---|---|
+| Cash sale | **+** | yes |
+| Card / Click / Payme / transfer | — | yes |
+| Cash refund | **−** | yes |
+| Cash debt collection | **+** | yes |
+| Cash supplier payment from the till | **−** | yes |
+| Cash drop, petty expense (`CashMovement OUT`) | **−** | yes |
+| Float added (`CashMovement IN`) | **+** | yes |
+| Credit sale, loyalty redemption | — | yes |
+
+`CashMovement` records **manual** movements only. A sale, a refund and a debt
+collection all affect the drawer too, but they are `payment` rows and the
+expected-cash query already reads them — recording them here as well would
+double-count every soʻm. That is why there is no debt-specific or refund-specific
+drawer logic anywhere in the codebase.
+
+A payout larger than the drawer holds is refused, against the live figure.
+`cash_movement` is append-only: a movement that can be edited after the shift
+is closed makes the difference meaningless.
+
+### Closing
+
+```
+FOR UPDATE the shift row
+  ├─ assert OPEN                → 409 SHIFT_ALREADY_CLOSED
+  ├─ assert no DRAFT sales      → 409 OPEN_DRAFTS_EXIST
+  ├─ compute expected
+  └─ store expected, counted, difference, closed_by, closed_at
+audit: the whole breakdown
+```
+
+`FOR UPDATE` rather than the conditional `UPDATE` every other transition in
+this system uses. The close has to read a large aggregate and then write a
+consistent snapshot of it; a conditional update could claim the row but not
+stop the aggregate moving underneath it. The lock holds for the few
+milliseconds the arithmetic takes, and shift closes are rare — this is the one
+place where a pessimistic lock is the simpler correct answer.
+
+`difference = counted − expected`. **Negative is short, positive is over. Both
+are stored; neither is silently corrected.** The audit entry carries the full
+breakdown, so a close is reproducible from the trail alone.
+
+### Shifts are optional, for now
+
+`sale.cash_register_shift_id` is nullable, and §5.5's
+`CHECK (status <> 'COMPLETED' OR cash_register_shift_id IS NOT NULL)` is
+deliberately **not** declared. A shop that does not open a till still sells, no
+screen forces a shift open, and mandating it would make every existing checkout
+path fail. The shift is attached when one is open; the Z-report is then about
+the shifts that actually happened. Revisit when the POS guarantees an open
+shift before the first sale.
+
+### Z-report
+
+`GET /shifts/:id/report` — opening float, sales count and gross, per-method
+tender totals, every drawer movement with its reason, expected / counted /
+difference, and who opened and closed it. Every number is a query over the
+shift's own rows; nothing is precomputed, because a shift's data is small and a
+stale report is worse than a slow one.
+
+While a shift is open, `expected` is live. Once closed, it is the stored
+figure — and a movement written against a closed shift afterwards cannot change
+what the cashier signed for. A test asserts exactly that.
+
+---
+
+## Employees and store-aware authorization
+
+**A user's authority is per store.** The same person can be MANAGER at one
+branch and CASHIER at another — which a `role` column on the user cannot
+express, and which becomes a painful migration once sales reference the role.
+`StoreMembership` is that relation.
+
+Three checks compose (*§20.4*), and permission alone is never sufficient:
+
+1. **Permission** — may this role do this kind of thing? (`PermissionsGuard`)
+2. **Tenant scope** — is the row in the caller's organization? (Prisma extension, automatic)
+3. **Store scope** — is it in a store the caller works in? (explicit, per service)
+
+A manager with `sales.read` still cannot read another branch's sales.
+`AssignmentsService.assertStoreAccess()` is the one place that says so; a
+wildcard holder passes it, because an owner is org-wide and implicitly a member
+of every store.
+
+### Assignments
+
+| Method | Path | |
+|---|---|---|
+| `GET` | `/employees/:id/assignments` | which stores, which role in each |
+| `POST` | `/employees/:id/assignments` | assign, or change the role if already there |
+| `DELETE` | `/employees/:id/assignments/:storeId` | unassign |
+
+Assigning is an upsert, because `UNIQUE (user_id, store_id)` means one
+membership per store and the screen's "change role" button is the same action.
+Exactly one assignment is `isPrimary` — where a fresh session lands — and
+removing the primary promotes another so a login still goes somewhere
+deterministic.
+
+**The last assignment cannot be removed.** A user with no membership can log in
+and reach nothing, which looks like a broken account rather than a deliberate
+change. Deactivate the employee instead.
+
+Every assignment change bumps `tokenVersion`, so the employee's existing tokens
+are rejected on their **next request** rather than living out their fifteen
+minutes. A test logs in, changes an assignment, and asserts the old token now
+returns 401.
+
+### Account actions
+
+| Action | |
+|---|---|
+| `PATCH /employees/:id/activate` | puts a deactivated account back to work |
+| `DELETE /employees/:id` | deactivates; never deletes — sales name them forever |
+| `POST /employees/:id/reset-password` | administrator sets it, hands it over out of band |
+| `POST /employees/:id/revoke-sessions` | signs out everywhere, immediately |
+
+**A password is never returned and never logged.** The administrator supplies
+it and delivers it out of band; a generated password returned in JSON ends up
+in a log, a proxy cache and a screenshot. The audit entry records that a reset
+happened, not what it was — there is deliberately no "log the whole DTO"
+convenience anywhere in this codebase (*§21.4*). The same strength rules the
+user sees on the security screen apply: an administrator setting a colleague's
+password is not exempt from them.
+
+Revoking refresh tokens alone would leave the current access token valid for
+the rest of its life, so the token version is bumped too. That is what makes
+"sign out everywhere" mean *now*.
+
+### Activity summary
+
+`GET /employees/:id/activity?from=&to=` — sales count, revenue, discount given,
+margin, average check, returns, the shifts they opened with each difference,
+inventory adjustments, and active sessions. Aggregates, not a row dump: the
+question is "is this cashier selling" and "how much did they discount", and
+each is one query.
+
+### Cash permissions
+
+| Action | Permission | Who has it |
+|---|---|---|
+| Read registers, shifts, Z-report | `cash.read` | cashier, manager |
+| Open / close a shift | `cash.open_shift` / `cash.close_shift` | cashier, manager |
+| Record a manual movement | `cash.movement` | **manager only** |
+| Create / archive a register | `stores.manage` | administrator |
+
+A till operator can open the drawer, sell from it and close it, but **cannot
+pay money out of it on their own authority**. That separation is the point of
+`cash.movement` being a distinct permission, and a test asserts the cashier
+gets a 403.
+
+```bash
+# Open the till with a 200,000 float
+curl -s -X POST "$API/shifts" -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"registerId":"REGISTER_ID","openingAmount":200000}'
+
+# Drop 100,000 to the safe - reason is mandatory
+curl -s -X POST "$API/shifts/$SHIFT/movements" -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"direction":"OUT","type":"DROP","amount":100000,"reason":"Seyfga topshirildi"}'
+
+# The Z-report, any time
+curl -s "$API/shifts/$SHIFT/report" -H "Authorization: Bearer $TOKEN"
+
+# Close and count
+curl -s -X POST "$API/shifts/$SHIFT/close" -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' -d '{"countedCashAmount":115000}'
+```
+
+---
+
 ## Foundation behaviour worth knowing
 
 **API versioning.** URI-based: every route lives under `/api/v1/...`. The
@@ -1843,7 +2056,9 @@ Sprint 1 is the foundation. Phases follow *§33 Implementation order*:
 | **7 ✅** | Procurement: suppliers, purchase orders, partial receiving, payables | over-receipt and over-payment are both refused by the database |
 | **8 ✅** | Returns & exchanges: quantity guard, net refunds, debt offset, net settlement | a line can never be over-returned, and a partial return strands no soʻm |
 | **9 ✅** | Discounts, promotions and loyalty: one winner per level, points as a tender | a balance always equals its own ledger, and promotions never stack |
-| 10+ | Cash register and shifts, reporting, notifications |
+| **10 ✅** | Cash register, shifts, employee administration, store-aware RBAC | the drawer always equals its own payments and movements |
+| 11 | Reporting and dashboard metrics |
+| 12 | Notifications, Telegram, audit search |
 
 ---
 

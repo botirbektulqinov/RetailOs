@@ -2,6 +2,7 @@ import { HttpStatus, Injectable } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 
 import { AuditService } from '../audit/audit.service';
+import { CashService } from '../cash/cash.service';
 import { nextDocumentNumber } from '../common/document-number';
 import { BusinessRuleException } from '../common/exceptions/business-rule.exception';
 import { ErrorCode } from '../common/exceptions/error-codes';
@@ -42,6 +43,7 @@ export class SalesService {
     private readonly prisma: PrismaService,
     private readonly inventory: InventoryService,
     private readonly idempotency: IdempotencyService,
+    private readonly cash: CashService,
     private readonly promotions: PromotionsService,
     private readonly loyalty: LoyaltyService,
     private readonly audit: AuditService,
@@ -361,12 +363,19 @@ export class SalesService {
       prefix: 'S',
     });
 
+    // The shift this is rung on, when the store runs one. Null is allowed: a
+    // shop that does not open a till still sells, and the Z-report is then
+    // about the shifts that actually happened (§19, and the note in the
+    // cash_register migration).
+    const shiftId = await this.cash.openShiftIdFor(tx, tenant.storeId);
+
     const sale = await tx.sale.create({
       data: {
         organizationId: tenant.organizationId,
         storeId: tenant.storeId,
         warehouseId: warehouse.id,
         customerId: customer?.id ?? null,
+        cashRegisterShiftId: shiftId,
         saleNumber,
         // Written as COMPLETED directly. A two-step insert-then-update would
         // leave a DRAFT visible to a concurrent reader for the length of the
@@ -438,6 +447,7 @@ export class SalesService {
           organizationId: tenant.organizationId,
           storeId: tenant.storeId,
           customerId: customer?.id ?? null,
+          cashRegisterShiftId: shiftId,
           direction: 'IN',
           method: payment.method,
           amount: BigInt(payment.amount),
@@ -753,6 +763,9 @@ export class SalesService {
             organizationId: tenant.organizationId,
             storeId: tenant.storeId,
             customerId: allocation.payment.customerId,
+            // The reversal leaves today's drawer, not the shift the original
+            // sale was rung on — that shift may be closed and signed for.
+            cashRegisterShiftId: await this.cash.openShiftIdFor(tx, tenant.storeId),
             direction: 'OUT',
             method: allocation.payment.method,
             amount: allocation.amount,
@@ -820,6 +833,7 @@ export class SalesService {
         saleNumber: true,
         storeId: true,
         warehouseId: true,
+        cashRegisterShiftId: true,
         status: true,
         returnStatus: true,
         subtotalAmount: true,

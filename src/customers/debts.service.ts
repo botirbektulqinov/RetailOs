@@ -2,6 +2,7 @@ import { HttpStatus, Injectable } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 
 import { AuditService } from '../audit/audit.service';
+import { CashService } from '../cash/cash.service';
 import { BusinessRuleException } from '../common/exceptions/business-rule.exception';
 import { ErrorCode } from '../common/exceptions/error-codes';
 import { IdempotencyService } from '../common/idempotency/idempotency.service';
@@ -38,6 +39,7 @@ export class DebtsService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly idempotency: IdempotencyService,
+    private readonly cash: CashService,
     private readonly audit: AuditService,
   ) {}
 
@@ -257,6 +259,9 @@ export class DebtsService {
         organizationId: tenant.organizationId,
         storeId: tenant.storeId,
         customerId,
+        // A cash collection lands in the open drawer, exactly as a cash sale
+        // does — which is why there is no debt-specific drawer logic.
+        cashRegisterShiftId: await this.cash.openShiftIdFor(tx, tenant.storeId),
         direction: 'IN',
         method: dto.method,
         amount: BigInt(dto.amount),
