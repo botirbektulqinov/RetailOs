@@ -1,4 +1,4 @@
-import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
+import { ApiProperty, ApiPropertyOptional, PartialType } from '@nestjs/swagger';
 import { Type } from 'class-transformer';
 import {
   ArrayMaxSize,
@@ -185,10 +185,10 @@ export class CreateGroupDto {
   creditLimit?: number;
 }
 
-export class UpdateGroupDto extends CreateGroupDto {
-  @ApiPropertyOptional()
-  declare name: string;
-}
+/** PartialType, so a PATCH that changes only the discount is not rejected for
+ *  omitting the name — `declare` would leave the inherited @IsNotEmpty() in
+ *  place, and validation metadata is what actually decides. */
+export class UpdateGroupDto extends PartialType(CreateGroupDto) {}
 
 // ── Debts ──────────────────────────────────────────────────────────────────
 

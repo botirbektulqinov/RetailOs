@@ -238,6 +238,7 @@ src/
   sales/                   checkout, sale history, receipts, cancellation
     pricing.ts             the §10.3 calculation pipeline, pure and testable
   customers/               customers, groups, notes and the debt ledger
+  procurement/             suppliers, purchase orders, receiving and payables
   audit/                   the append-only audit trail
   common/
     money/                 Money primitives: bigint minor units (§8)
@@ -257,7 +258,7 @@ prisma/
   seed.ts
 test/
   setup-e2e.ts             raises the auth throttle before anything imports
-  foundation · auth · catalog · inventory · sales · customers  .e2e-spec.ts
+  foundation · auth · catalog · inventory · sales · customers · procurement  .e2e-spec.ts
   helpers/seed-org.ts      two complete look-alike organizations, for isolation probes
 docs/
   ARCHITECTURE.md          the source of truth
@@ -1271,6 +1272,165 @@ curl -s -X POST "$API/debts/DEBT_ID/write-off" -H "Authorization: Bearer $TOKEN"
 
 ---
 
+## Suppliers and purchases
+
+Receiving is the only path in the system that creates stock out of nothing, so
+it is the one guarded hardest.
+
+### Lifecycle
+
+```
+DRAFT ──order──▶ ORDERED ──receive──▶ PARTIALLY_RECEIVED ──receive──▶ RECEIVED
+  └───────────────┴── cancel, only while nothing received and nothing paid
+```
+
+`order: true` on creation skips DRAFT, because a shopkeeper phoning an order in
+has no use for a draft. Lines are editable only in DRAFT — an order already
+sent to the supplier is a commitment, not a scratchpad.
+
+**Payment state is separate from receipt state.** A purchase can be `RECEIVED`
+and unpaid, or paid and not yet delivered. Conflating them into one status is
+why so many systems cannot answer "what do we owe".
+
+### Receiving
+
+`POST /purchases/:id/receive` is **repeatable** — three deliveries against one
+order produce three calls and three sets of movements. Omit `items` and
+everything still outstanding is taken as delivered, which is the common case.
+
+Per line, in one transaction:
+
+```sql
+UPDATE purchase_item
+   SET received_quantity = received_quantity + $qty
+ WHERE id = $id
+   AND received_quantity + $qty <= ordered_quantity;   -- BR-16
+```
+
+Zero rows → **409 `OVER_RECEIPT`**, with the outstanding quantity in the
+payload. Two clerks booking in the same pallet cannot together exceed the
+order: one of them loses.
+
+Over-receipt is refused rather than silently accepted. A delivery larger than
+the order is a real event, but it is a *purchase amendment* — treating it as an
+automatic quantity bump is how phantom stock appears.
+
+Stock then moves through `InventoryService.apply()` like everything else, so a
+receipt is an ordinary `PURCHASE` entry in the ledger rather than a special
+case, and §9.7's reconciliation still returns nothing afterwards. The unit cost
+travels with the receipt, which is what rolls the level's moving average
+forward (*§8.6*) — and `unitCost` may be corrected at receipt time when the
+invoice disagrees with the order.
+
+**`Idempotency-Key` is required.** Receiving the same delivery twice adds real
+stock that does not exist; it is the second-most expensive duplicate in the
+system after a double refund.
+
+### Costing
+
+`purchase_item.unit_cost` is the supplier's unit price. `shipping_amount` and
+`discount_amount` sit at the purchase header and are **not** allocated into
+unit costs. Landed cost is a real feature, but it needs an allocation basis —
+by value, by weight, by quantity — that nobody has specified. When it arrives,
+`allocate()` does the work and only the receiving code changes.
+
+The database checks the arithmetic:
+`total = subtotal − discount + shipping`, and `paid <= total`.
+
+### Payables
+
+A supplier's balance is **derived, never stored**:
+
+```
+payable = Σ(total − paid) over committed purchases − unapplied on-account payments
+```
+
+There is no `supplier.balance` column, for the same reason there is no
+`customer.debt` column.
+
+`supplier_payment.purchase_id` is nullable:
+
+- **set** — settles that invoice under `paid + $amount <= total`; zero rows →
+  **409 `SUPPLIER_OVERPAYMENT`**. Two managers settling one invoice cannot
+  together overpay it.
+- **null** — a payment on account. It reduces the net payable and shows as
+  **unapplied credit** rather than being silently absorbed, because a
+  shopkeeper who has paid in advance should be able to see that they have.
+
+Partial payment is the normal case: pay 800,000 against 1,250,000 and the
+remaining 450,000 stays outstanding while the purchase remains `RECEIVED`.
+
+`supplier_payment` is **append-only**, enforced by trigger. Money that has left
+the business is not editable; a payment recorded wrongly is corrected by
+another payment, exactly as in the customer ledger.
+
+> There is deliberately no "apply this on-account payment to that invoice
+> later" endpoint, which §16.2 sketches. Applying it would mean rewriting a
+> payment record, and the statement already shows both sides. Bookkeeping the
+> design does not ask for.
+
+### Statement
+
+`GET /suppliers/:id/statement?from=&to=` merges purchases (debits) and payments
+(credits) chronologically with a running balance, from one `UNION ALL`. No
+table backs it.
+
+```
+2026-09-22  PURCHASE  PO-000001   debit 1 250 000                → 1 250 000
+2026-09-22  PAYMENT   TP-4412                    credit 800 000 →   450 000
+```
+
+### Endpoints
+
+| Method | Path | Permission |
+|---|---|---|
+| `GET` `POST` | `/suppliers` | `suppliers.read` / `suppliers.create` |
+| `GET` `PATCH` | `/suppliers/:id` | `suppliers.read` / `suppliers.update` |
+| `GET` | `/suppliers/:id/balance` | `suppliers.read` |
+| `GET` | `/suppliers/:id/purchases` `…/payments` `…/statement` | `purchases.read` |
+| `PATCH` | `/suppliers/:id/archive` `…/restore` | `suppliers.update` |
+| `POST` | `/suppliers/payments` | `purchases.pay` + `Idempotency-Key` |
+| `GET` `POST` | `/purchases` | `purchases.read` / `purchases.create` |
+| `GET` `PATCH` | `/purchases/:id` | `purchases.read` / `purchases.create` |
+| `POST` | `/purchases/:id/order` | `purchases.create` |
+| `POST` | `/purchases/:id/receive` | `purchases.receive` + `Idempotency-Key` |
+| `POST` | `/purchases/:id/cancel` | `purchases.cancel` |
+
+A supplier we still owe cannot be archived — the same rule as a customer who
+owes us, for the same reason.
+
+**Role change:** `purchases.cancel` was added to MANAGER in this sprint. A
+manager who may raise a purchase order but not cancel their own unreceived one
+has to ask an administrator to undo a typo, and cancellation is already
+guarded: impossible once anything has been received or paid.
+
+```bash
+# Order 100 units, straight to the supplier
+curl -s -X POST "$API/purchases" -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"supplierId":"SUP","items":[{"variantId":"V","quantity":"100.000","unitCost":12000}],
+       "shippingAmount":50000,"order":true}'
+
+# 60 arrive today
+curl -s -X POST "$API/purchases/$PO/receive" -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' -H "Idempotency-Key: $(uuidgen)" \
+  -d '{"items":[{"variantId":"V","quantity":"60.000"}],"supplierInvoiceNumber":"INV-5521"}'
+
+# the other 40 next week - no body needed
+curl -s -X POST "$API/purchases/$PO/receive" -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' -H "Idempotency-Key: $(uuidgen)" -d '{}'
+
+# Pay part of the invoice
+curl -s -X POST "$API/suppliers/payments" -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' -H "Idempotency-Key: $(uuidgen)" \
+  -d '{"supplierId":"SUP","purchaseId":"PO","amount":800000,"method":"TRANSFER","reference":"TP-4412"}'
+
+# Who do we owe, most first
+curl -s "$API/suppliers?hasPayable=true&sort=payable:desc" -H "Authorization: Bearer $TOKEN"
+```
+
+---
+
 ## Foundation behaviour worth knowing
 
 **API versioning.** URI-based: every route lives under `/api/v1/...`. The
@@ -1341,7 +1501,7 @@ Sprint 1 is the foundation. Phases follow *§33 Implementation order*:
 | **4 ✅** | Inventory: levels, the movement ledger, the single `apply()` write path, warehouses, counts, transfers | the projection equals the ledger under parallel load |
 | **5 ✅** | Sales / POS: pricing pipeline, checkout transaction, mixed payments, idempotency, cancellation | a sale's own figures cannot disagree — the database checks them |
 | **6 ✅** | Customers & debt: groups, notes, receivables, FIFO collection, write-off | no debt and no payment can disappear; over-payment is refused |
-| 7 | Procurement: suppliers, purchases, receiving, payables |
+| **7 ✅** | Procurement: suppliers, purchase orders, partial receiving, payables | over-receipt and over-payment are both refused by the database |
 | 8+ | Returns & exchanges, discounts & loyalty, cash register, reporting |
 
 ---

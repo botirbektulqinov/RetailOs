@@ -78,6 +78,11 @@ export const SYSTEM_ROLES: readonly SystemRoleDef[] = [
       'purchases.create',
       'purchases.receive',
       'purchases.pay',
+      // Added in Sprint 7. A manager who may raise a purchase order but not
+      // cancel their own unreceived one has to ask an administrator to undo a
+      // typo, and cancellation is already guarded: impossible once anything
+      // has been received or paid.
+      'purchases.cancel',
       'suppliers.read',
       'suppliers.create',
       'suppliers.update',

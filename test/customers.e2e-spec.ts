@@ -322,15 +322,12 @@ describe('Customers and debt (e2e)', () => {
 
     it('records an opening balance distinctly from a sale debt', async () => {
       const id = await makeCustomer();
-      const res = await api()
-        .post('/api/v1/debts')
-        .set(auth(managerToken))
-        .send({
-          customerId: id,
-          amount: 200_000,
-          origin: 'OPENING_BALANCE',
-          note: "O'tgan yildan",
-        });
+      const res = await api().post('/api/v1/debts').set(auth(managerToken)).send({
+        customerId: id,
+        amount: 200_000,
+        origin: 'OPENING_BALANCE',
+        note: "O'tgan yildan",
+      });
 
       expect(res.status).toBe(201);
       expect(res.body.origin).toBe('OPENING_BALANCE');

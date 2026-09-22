@@ -47,6 +47,10 @@ const TENANT_MODELS = new Set<string>([
   'IdempotencyRecord',
   'CustomerGroup',
   'CustomerNote',
+  'Supplier',
+  'Purchase',
+  'PurchaseItem',
+  'SupplierPayment',
 ]);
 
 /** Operations whose `where` must be narrowed to the tenant. */

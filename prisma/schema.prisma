@@ -126,6 +126,7 @@ model Store {
   warehouses   Warehouse[]
   memberships  StoreMembership[]
   sales        Sale[]
+  purchases    Purchase[]
 
   // Every tenant model carries this compound unique so a scoped lookup can
   // never be written as a bare findUnique({ where: { id } }) — see §4.3.
@@ -519,6 +520,7 @@ model ProductVariant {
   countItems    InventoryCountItem[]
   transferItems StockTransferItem[]
   saleItems     SaleItem[]
+  purchaseItems PurchaseItem[]
 
   @@unique([organizationId, id])
   @@index([organizationId, barcode])
@@ -1195,4 +1197,163 @@ model IdempotencyRecord {
   @@unique([organizationId, key])
   @@index([expiresAt])
   @@map("idempotency_record")
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Procurement (Sprint 7)
+// ──────────────────────────────────────────────────────────────────────────
+
+enum PurchaseStatus {
+  DRAFT
+  ORDERED
+  PARTIALLY_RECEIVED
+  RECEIVED
+  CANCELLED
+}
+
+model Supplier {
+  id             String @id @default(uuid()) @db.Uuid
+  organizationId String @map("organization_id") @db.Uuid
+
+  name        String
+  contactName String? @map("contact_name")
+  phone       String?
+  email       String? @db.Citext
+  address     String?
+  notes       String?
+
+  /// How long this supplier gives us to pay. Drives the expected payment date
+  /// on the payables report.
+  paymentTermDays Int @default(0) @map("payment_term_days") @db.SmallInt
+
+  status     EntityStatus @default(ACTIVE)
+  archivedAt DateTime?    @map("archived_at") @db.Timestamptz(6)
+
+  createdBy String?  @map("created_by") @db.Uuid
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  purchases Purchase[]
+  payments  SupplierPayment[]
+
+  @@unique([organizationId, id])
+  @@index([organizationId, name])
+  @@map("supplier")
+}
+
+/// A purchase order, and later a receipt of goods.
+///
+/// Payment state is separate from receipt state: a purchase can be RECEIVED
+/// and unpaid, or paid and not yet delivered. Conflating them into one status
+/// is why so many systems cannot answer "what do we owe".
+model Purchase {
+  id             String @id @default(uuid()) @db.Uuid
+  organizationId String @map("organization_id") @db.Uuid
+  storeId        String @map("store_id") @db.Uuid
+
+  /// Where the goods land when received.
+  warehouseId String @map("warehouse_id") @db.Uuid
+  supplierId  String @map("supplier_id") @db.Uuid
+
+  purchaseNumber        String         @map("purchase_number")
+  status                PurchaseStatus @default(DRAFT)
+  supplierInvoiceNumber String?        @map("supplier_invoice_number")
+
+  orderedAt   DateTime? @map("ordered_at") @db.Timestamptz(6)
+  expectedAt  DateTime? @map("expected_at") @db.Timestamptz(6)
+  receivedAt  DateTime? @map("received_at") @db.Timestamptz(6)
+  cancelledAt DateTime? @map("cancelled_at") @db.Timestamptz(6)
+
+  /// Money is BIGINT minor units. subtotal is the sum of the lines; shipping
+  /// and discount sit at the header and are NOT allocated into unit costs —
+  /// landed cost needs an allocation basis nobody has specified yet (§15.5).
+  subtotalAmount BigInt @default(0) @map("subtotal_amount")
+  discountAmount BigInt @default(0) @map("discount_amount")
+  shippingAmount BigInt @default(0) @map("shipping_amount")
+  totalAmount    BigInt @default(0) @map("total_amount")
+
+  /// Sum of this purchase's supplier payments, maintained under a guard.
+  /// `remaining` is total - paid, computed, never stored — the same reasoning
+  /// as the customer receivable.
+  paidAmount BigInt @default(0) @map("paid_amount")
+
+  note         String?
+  cancelReason String? @map("cancel_reason")
+
+  createdBy  String  @map("created_by") @db.Uuid
+  receivedBy String? @map("received_by") @db.Uuid
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  supplier Supplier          @relation(fields: [supplierId], references: [id])
+  store    Store             @relation(fields: [storeId], references: [id])
+  items    PurchaseItem[]
+  payments SupplierPayment[]
+
+  @@unique([organizationId, id])
+  @@unique([organizationId, purchaseNumber])
+  @@index([organizationId, supplierId, status])
+  @@index([organizationId, status, createdAt(sort: Desc)])
+  @@map("purchase")
+}
+
+model PurchaseItem {
+  id               String @id @default(uuid()) @db.Uuid
+  organizationId   String @map("organization_id") @db.Uuid
+  purchaseId       String @map("purchase_id") @db.Uuid
+  productVariantId String @map("product_variant_id") @db.Uuid
+
+  orderedQuantity  Decimal @map("ordered_quantity") @db.Decimal(14, 3)
+  receivedQuantity Decimal @default(0) @map("received_quantity") @db.Decimal(14, 3)
+
+  /// The supplier's unit price. Historical: a later price change must not
+  /// rewrite what this delivery cost.
+  unitCost   BigInt @map("unit_cost")
+  lineAmount BigInt @map("line_amount")
+
+  purchase Purchase       @relation(fields: [purchaseId], references: [id], onDelete: Cascade)
+  variant  ProductVariant @relation(fields: [productVariantId], references: [id])
+
+  @@unique([organizationId, id])
+  @@unique([purchaseId, productVariantId])
+  @@index([organizationId, productVariantId])
+  @@map("purchase_item")
+}
+
+/// Deliberately NOT the same table as customer `Payment` — docs/ARCHITECTURE.md §15.4.
+///
+/// They look symmetrical and are not: direction, targets, till association,
+/// permissions, reporting and volume all differ. Unifying them would cost a
+/// direction flag plus a target discriminator plus a permission branch plus a
+/// reporting branch — four conditionals to avoid one small table.
+model SupplierPayment {
+  id             String @id @default(uuid()) @db.Uuid
+  organizationId String @map("organization_id") @db.Uuid
+  storeId        String @map("store_id") @db.Uuid
+  supplierId     String @map("supplier_id") @db.Uuid
+
+  /// null = paid on account rather than against one invoice.
+  purchaseId String? @map("purchase_id") @db.Uuid
+
+  method PaymentMethod
+  amount BigInt
+
+  reference String?
+  note      String?
+
+  paidAt    DateTime @default(now()) @map("paid_at") @db.Timestamptz(6)
+  createdBy String   @map("created_by") @db.Uuid
+
+  idempotencyKey String? @map("idempotency_key")
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  supplier Supplier  @relation(fields: [supplierId], references: [id])
+  purchase Purchase? @relation(fields: [purchaseId], references: [id])
+
+  @@unique([organizationId, id])
+  @@index([organizationId, supplierId, paidAt(sort: Desc)])
+  @@index([purchaseId])
+  @@map("supplier_payment")
 }

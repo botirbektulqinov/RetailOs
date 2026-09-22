@@ -198,6 +198,19 @@ export async function dropTestOrg(db: PrismaClient, organizationId: string): Pro
     await db.$executeRaw`ALTER TABLE audit_log ENABLE TRIGGER tg_audit_log_immutable`;
   }
 
+  // Procurement before inventory: purchase lines reference variants, and
+  // supplier_payment is append-only for the application like every other
+  // record of money that has moved.
+  await db.$executeRaw`ALTER TABLE supplier_payment DISABLE TRIGGER tg_supplier_payment_immutable`;
+  try {
+    await db.supplierPayment.deleteMany({ where: { organizationId } });
+  } finally {
+    await db.$executeRaw`ALTER TABLE supplier_payment ENABLE TRIGGER tg_supplier_payment_immutable`;
+  }
+  await db.purchaseItem.deleteMany({ where: { organizationId } });
+  await db.purchase.deleteMany({ where: { organizationId } });
+  await db.supplier.deleteMany({ where: { organizationId } });
+
   // Selling before inventory: sale lines reference variants, allocations
   // reference payments and receivables, and payment_allocation is append-only
   // for the application exactly like the movement ledger.
