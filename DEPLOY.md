@@ -8,7 +8,7 @@ buyrug'i bor — u ishlamasa, keyingisiga o'tmang.
 
 | Nima | Qayerda |
 |---|---|
-| Server | `13.63.129.185` · eu-north-1 · Ubuntu · t3.small (2 vCPU, 2 GB) |
+| Server | `16.192.55.180` · eu-north-1 · Ubuntu · t3.small (2 vCPU, 2 GB) |
 | API | `https://SIZNING-DOMEN/api/v1` |
 | Swagger | `https://SIZNING-DOMEN/api/docs` |
 | Ma'lumotlar bazasi | Docker ichida, tashqaridan **umuman ochiq emas** |
@@ -30,7 +30,8 @@ groups → havolani bosing → Inbound rules → Edit inbound rules → Add rule
 | SSH | 22 | **faqat sizning IP** (`My IP`) |
 
 > SSH ni `0.0.0.0/0` da qoldirmang. Butun internet sizning 22-portingizga
-> parol tanlashga urinib turadi.
+> urinib turadi. Brauzerdan kalit o'rnatish uchun uni vaqtincha ochish kerak
+> bo'lsa — ochib, ish bitgach darhol `My IP` ga qaytaring.
 
 PostgreSQL uchun **hech qanday qoida qo'shmang**. Baza faqat Docker tarmog'i
 ichida ishlaydi — internetga chiqarilmagan.
@@ -40,13 +41,34 @@ ichida ishlaydi — internetga chiqarilmagan.
 ## 2. Serverga ulaning
 
 ```bash
-# .pem kalitingiz yonida:
-chmod 400 retailos-key.pem
-ssh -i retailos-key.pem ubuntu@13.63.129.185
+ssh -i ~/.ssh/retailos_ed25519 ubuntu@16.192.55.180
 ```
 
-Ulanmasa: Security Group da 22-port sizning IP ga ochiqmi, kalit fayl to'g'rimi,
-foydalanuvchi `ubuntu` mi (Ubuntu AMI uchun shunday) — shularni tekshiring.
+Har safar uzun buyruq yozmaslik uchun `~/.ssh/config` ga qo'shing:
+
+```
+Host retailos
+    HostName 16.192.55.180
+    User ubuntu
+    IdentityFile ~/.ssh/retailos_ed25519
+```
+
+Shundan keyin shunchaki `ssh retailos`.
+
+**Ulanmasa** — deyarli har doim serverdagi `authorized_keys` joyida emas.
+Brauzerdan kiring (EC2 → Instances → Connect → EC2 Instance Connect) va
+**`sudo su` QILMASDAN**, to'liq yo'l bilan qo'ying:
+
+```bash
+sudo mkdir -p /home/ubuntu/.ssh && sudo chmod 700 /home/ubuntu/.ssh
+echo 'SIZNING-PUBLIC-KEYINGIZ' | sudo tee -a /home/ubuntu/.ssh/authorized_keys
+sudo chmod 600 /home/ubuntu/.ssh/authorized_keys
+sudo chown -R ubuntu:ubuntu /home/ubuntu/.ssh
+```
+
+`sudo su` dan keyin `~` endi `/home/ubuntu` emas, `/root` bo'ladi — kalit
+noto'g'ri foydalanuvchiga tushadi. Oxirgi `chown` ham majburiy: sshd egasi
+boshqa bo'lgan `authorized_keys` ni umuman o'qimaydi.
 
 ---
 
@@ -106,8 +128,8 @@ yo'q) ikkita **A record** qo'shing:
 
 | Type | Name | Value | TTL |
 |---|---|---|---|
-| A | `@` | `13.63.129.185` | Auto |
-| A | `api` | `13.63.129.185` | Auto |
+| A | `@` | `16.192.55.180` | Auto |
+| A | `api` | `16.192.55.180` | Auto |
 
 **Cloudflare ishlatsangiz:** bulut belgisini **kulrang** (DNS only) qiling.
 To'q sariq (proxied) holatda Caddy sertifikat ololmaydi.
@@ -115,7 +137,7 @@ To'q sariq (proxied) holatda Caddy sertifikat ololmaydi.
 **Tekshiruv** (o'z kompyuteringizdan, serverdan emas):
 ```bash
 nslookup api.sizningdomen.uz
-# Javobda 13.63.129.185 chiqishi kerak
+# Javobda 16.192.55.180 chiqishi kerak
 ```
 
 DNS tarqalishi 5 daqiqadan bir necha soatgacha ketishi mumkin. **Bu chiqmaguncha
@@ -269,8 +291,6 @@ docker compose -f docker-compose.prod.yml logs caddy --tail 50
 
 ## Keyingi qadamlar (hozir shart emas)
 
-- **Elastic IP.** Hozirgi `13.63.129.185` server to'xtab-yonsa o'zgaradi va
-  domen ishlamay qoladi. EC2 → Elastic IPs → Allocate → Associate.
 - **Zaxira nusxa.** Baza Docker volume da. Kundalik dump:
   `docker compose -f docker-compose.prod.yml exec postgres pg_dump -U retailos retailos | gzip > backup-$(date +%F).sql.gz`
 - **RDS.** Baza o'sganda uni alohida Amazon RDS ga ko'chirish — `DATABASE_URL`
