@@ -11,6 +11,20 @@
 {$DOMAIN} {
 	encode zstd gzip
 
+	# The API docs sit behind a password — see DEPLOY.md.
+	#
+	# Enforced here rather than in the application: the docs are a static
+	# surface served by Swagger, and a guard in NestJS would mean auth code
+	# whose only job is to protect documentation. The proxy already terminates
+	# every request; this is four lines in the thing that is already there.
+	#
+	# The matcher is a prefix, so it covers /api/docs, /api/docs/json and the
+	# Swagger UI's own bundles. Miss those and the page loads as a blank frame.
+	@docs path /api/docs*
+	basic_auth @docs {
+		{$DOCS_USER} {$DOCS_HASH}
+	}
+
 	# Real client IPs reach the app, which is what the audit log records and
 	# what the rate limiter counts. TRUST_PROXY=true is pinned in the compose
 	# file to match; the two must agree or every request looks like Caddy.

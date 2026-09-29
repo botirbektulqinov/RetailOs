@@ -85,6 +85,16 @@ services:
       - '443:443'
     environment:
       DOMAIN: ${DOMAIN:?DOMAIN is required}
+      # Both required, so a missing one fails the stack with a named variable
+      # rather than leaving the docs open or breaking Caddy's parse at runtime.
+      #
+      # DOCS_HASH holds a bcrypt hash whose every `$` must be written `$$` in
+      # .env. Compose reads `$2a$14$abc` as "$2a", "$14", then an undefined
+      # variable — and hands Caddy a silently truncated hash that can never
+      # match. DEPLOY.md generates the escaped value rather than asking anyone
+      # to type it.
+      DOCS_USER: ${DOCS_USER:?DOCS_USER is required}
+      DOCS_HASH: ${DOCS_HASH:?DOCS_HASH is required - see DEPLOY.md}
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       # Certificates live in a volume. Without it every restart re-requests

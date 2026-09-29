@@ -153,9 +153,22 @@ git clone https://github.com/botirbektulqinov/RetailOs.git
 cd RetailOs
 ```
 
-Endi maxfiy kalitlarni generatsiya qilib, `.env` faylini yozamiz. **Pastdagi
-blokni butunligicha** nusxalab qo'ying — kalitlar o'zi generatsiya bo'ladi,
-siz faqat `DOMAIN` qatorini o'zgartirasiz:
+Avval Swagger uchun parol o'ylab toping va uning hash'ini oling:
+
+```bash
+read -rsp "Swagger uchun parol: " DOCS_PW; echo
+DOCS_HASH_RAW=$(docker run --rm caddy:2-alpine caddy hash-password --plaintext "$DOCS_PW")
+DOCS_HASH_ESC=${DOCS_HASH_RAW//\$/\$\$}
+```
+
+> Oxirgi qator har bir `$` ni `$$` ga aylantiradi va **uni o'tkazib bo'lmaydi**.
+> Docker Compose `.env` dagi `$2a$14$abc...` ni "`$2a`, `$14`, keyin noma'lum
+> o'zgaruvchi" deb o'qiydi va Caddy'ga qirqilgan hash beradi — xato chiqmaydi,
+> shunchaki parol hech qachon to'g'ri kelmaydi.
+
+Endi qolgan maxfiy kalitlarni generatsiya qilib, `.env` faylini yozamiz.
+**Pastdagi blokni butunligicha** nusxalab qo'ying — kalitlar o'zi generatsiya
+bo'ladi, siz faqat `DOMAIN` qatorini o'zgartirasiz:
 
 ```bash
 cat > .env <<EOF
@@ -171,6 +184,10 @@ POSTGRES_DB=retailos
 # ── Maxfiy kalitlar (avtomatik) ──
 JWT_SECRET=$(openssl rand -base64 48)
 JWT_REFRESH_SECRET=$(openssl rand -base64 48)
+
+# ── Swagger paroli ──
+DOCS_USER=admin
+DOCS_HASH=${DOCS_HASH_ESC}
 
 # ── Boshqalar ──
 SWAGGER_ENABLED=true
@@ -245,14 +262,32 @@ Kirish: `+998901234567` / `RetailOS2026`.
 
 | Manzil | Nima |
 |---|---|
-| `https://api.sizningdomen.uz/api/docs` | **Swagger** — 100+ endpoint, "Try it out" ishlaydi |
-| `https://api.sizningdomen.uz/api/docs/json` | OpenAPI JSON (frontend uchun client generatsiya qilinadi) |
+| `https://api.sizningdomen.uz/api/docs` | **Swagger** — 100+ endpoint, "Try it out" ishlaydi. Parol so'raydi |
+| `https://api.sizningdomen.uz/api/docs/json` | OpenAPI JSON (frontend uchun client generatsiya qilinadi). Parol so'raydi |
 | `https://api.sizningdomen.uz/api/v1/health` | Health check |
 | `https://api.sizningdomen.uz/api/v1/auth/login` | Kirish |
 
-Swagger da ishlash: `/auth/login` dan `accessToken` oling → yuqoridagi
+Swagger da ishlash: brauzer avval `DOCS_USER` / parolni so'raydi, keyin sahifa
+ochiladi. So'ng `/auth/login` dan `accessToken` oling → yuqoridagi
 **Authorize** tugmasini bosing → tokenni qo'ying → endi barcha endpointlar
 ochiladi.
+
+### Swagger paroli haqida
+
+Parol faqat `/api/docs*` ga qo'yilgan — **API'ning o'ziga emas**. Mobil ilova
+ham, frontend ham hech qanday qo'shimcha parolsiz ishlayveradi; himoya
+qilinayotgani hujjat sahifasi, interfeys emas.
+
+Frontendchi OpenAPI faylini olish uchun:
+
+```bash
+curl -u admin:PAROL https://api.sizningdomen.uz/api/docs/json -o openapi.json
+```
+
+**Parolni almashtirish:** yuqoridagi `read` + `hash-password` blokini qayta
+yurgizing, `.env` dagi `DOCS_HASH` qatorini yangilang va
+`docker compose -f docker-compose.prod.yml up -d caddy` qiling. Build kerak
+emas — faqat Caddy qayta ko'tariladi, API to'xtamaydi.
 
 ---
 
@@ -279,6 +314,7 @@ Migratsiyalar avtomatik yuriladi (`migrate` servisi `api` dan oldin tugaydi).
 | `api` konteyner qayta-qayta o'chadi | `docker compose -f docker-compose.prod.yml logs api` — deyarli har doim `.env` dagi xato |
 | Build o'rtasida "killed" / OOM | Swap qo'shilmagan (3-qadam) |
 | `CORS_ORIGINS: must list at least one origin` | `.env` da `CORS_ORIGINS` bo'sh |
+| Swagger paroli to'g'ri, lekin baribir 401 | `.env` dagi `DOCS_HASH` da `$` lar `$$` qilinmagan |
 | Frontend dan so'rov CORS xatosi beradi | Frontend manzili `CORS_ORIGINS` ro'yxatida yo'q |
 
 Loglar:
