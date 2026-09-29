@@ -1,0 +1,100 @@
+# Production stack — see DEPLOY.md.
+#
+#   docker compose -f docker-compose.prod.yml up -d --build
+#
+# Standalone, not an override of docker-compose.yml. Compose *appends* list
+# values when it merges files, so an override cannot un-publish the dev
+# database port — and a PostgreSQL reachable from the internet is not a
+# mistake worth risking on a merge rule.
+#
+# Differences from the dev stack:
+#   - postgres publishes no host port; only the compose network reaches it
+#   - api publishes no host port; only Caddy reaches it
+#   - Caddy terminates TLS on 80/443 and obtains its own certificate
+#   - TRUST_PROXY=true, so client IPs in the audit log are real
+
+# Service containers are deliberately left unnamed. A fixed container_name
+# buys nothing here and stops a second stack (a staging copy, a blue-green
+# swap, a local rehearsal of this very file) from ever running beside the first.
+name: retailos
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER is required}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      POSTGRES_DB: ${POSTGRES_DB:-retailos}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB:-retailos}']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Migrations are their own step and never run from the application bootstrap
+  # (docs/ARCHITECTURE.md §32.4). Two api replicas racing to migrate is a bad
+  # first production incident.
+  migrate:
+    build:
+      context: .
+      target: builder
+    restart: 'no'
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-retailos}?schema=public
+    command: ['npx', 'prisma', 'migrate', 'deploy']
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    build:
+      context: .
+      target: runtime
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-retailos}?schema=public
+      # Startup refuses a secret still containing "dev-only" when
+      # NODE_ENV=production, so the placeholders cannot reach this far.
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET is required}
+      JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET:?JWT_REFRESH_SECRET is required}
+      # Must be non-empty in production, and never "*".
+      CORS_ORIGINS: ${CORS_ORIGINS:?CORS_ORIGINS is required}
+      # Pinned rather than read from .env: it must agree with the fact that
+      # Caddy is in front. Disagreeing makes every client IP read as Caddy's.
+      TRUST_PROXY: 'true'
+      SWAGGER_ENABLED: ${SWAGGER_ENABLED:-true}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      RATE_LIMIT_LIMIT: ${RATE_LIMIT_LIMIT:-600}
+      AUTH_RATE_LIMIT: ${AUTH_RATE_LIMIT:-5}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - '80:80'
+      - '443:443'
+    environment:
+      DOMAIN: ${DOMAIN:?DOMAIN is required}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      # Certificates live in a volume. Without it every restart re-requests
+      # from Let's Encrypt, and their rate limit is five per week per domain.
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      - api
+
+volumes:
+  postgres-data:
+  caddy-data:
+  caddy-config:

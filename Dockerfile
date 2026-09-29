@@ -2,7 +2,8 @@
 
 # ── Stage 1: dependencies + build ────────────────────────────────────────────
 # This stage keeps devDependencies, so docker-compose reuses it as the `migrate`
-# service (the Prisma CLI is a devDependency and must not ship in the runtime).
+# service — the Prisma CLI and tsx both live there. The runtime copies its
+# node_modules from `pruned` instead, so they do not ship with the app.
 FROM node:22-alpine AS builder
 
 WORKDIR /app
@@ -23,10 +24,17 @@ COPY src ./src
 # being baked into an image layer — the real URL arrives at runtime.
 RUN DATABASE_URL="postgresql://build:build@localhost:5432/build" npx prisma generate     && npm run build
 
-# Drop devDependencies from a copy of node_modules for the runtime stage.
+# ── Stage 2: the same tree, without devDependencies ──────────────────────────
+# Its own stage, because the prune must NOT happen inside `builder`: compose
+# runs the `migrate` service from `builder`, and every tool that service needs
+# is a devDependency. `prisma` happens to survive a prune — @prisma/client
+# declares it as a peer dependency — but `tsx` does not, so pruning in place
+# left `npx tsx prisma/seed.ts` to fetch tsx from the registry mid-deploy.
+FROM builder AS pruned
+
 RUN npm prune --omit=dev
 
-# ── Stage 2: runtime ─────────────────────────────────────────────────────────
+# ── Stage 3: runtime ─────────────────────────────────────────────────────────
 FROM node:22-alpine AS runtime
 
 WORKDIR /app
@@ -39,7 +47,7 @@ RUN apk add --no-cache wget
 # Run as the image's built-in unprivileged user rather than root.
 USER node
 
-COPY --chown=node:node --from=builder /app/node_modules ./node_modules
+COPY --chown=node:node --from=pruned /app/node_modules ./node_modules
 COPY --chown=node:node --from=builder /app/dist ./dist
 COPY --chown=node:node --from=builder /app/package.json ./package.json
 # Kept for reference and for `prisma migrate status` run against this image.

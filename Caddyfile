@@ -1,0 +1,23 @@
+# Reverse proxy + automatic HTTPS.
+#
+# Caddy obtains and renews the Let's Encrypt certificate by itself, so there is
+# no certbot to install, no renewal timer to forget and no reload hook to get
+# wrong. The domain arrives as $DOMAIN from the environment.
+#
+# The API is the only thing published. PostgreSQL has no host port at all in
+# docker-compose.prod.yml — it is reachable only from inside the compose
+# network, which is the one database exposure mistake worth designing out.
+
+{$DOMAIN} {
+	encode zstd gzip
+
+	# Real client IPs reach the app, which is what the audit log records and
+	# what the rate limiter counts. TRUST_PROXY=true is pinned in the compose
+	# file to match; the two must agree or every request looks like Caddy.
+	reverse_proxy api:3000
+
+	log {
+		output stdout
+		format console
+	}
+}
